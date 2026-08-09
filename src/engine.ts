@@ -550,6 +550,9 @@ export class Engine {
     if (auto.size > 0) {
       warnings.push(`The database maintains ${[...auto].join(', ')} by itself; those are not shown as changes.`);
     }
+    // Whatever this engine cannot guarantee is said here, on the card, every
+    // time — not once in a README the approver has never read.
+    warnings.push(...this.adapter.limitations);
 
     return {
       sql,

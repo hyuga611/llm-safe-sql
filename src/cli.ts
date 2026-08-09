@@ -5,6 +5,7 @@ import { loadConfig, type Config } from './config.js';
 import { Refusal } from './refusal.js';
 import { openAdminSession, type AdminSession } from './session.js';
 import { recordPlan, type PlanStatus } from './store.js';
+import { displayReplacer } from './serialize.js';
 import { VERSION } from './version.js';
 
 /**
@@ -41,6 +42,7 @@ Exit codes: 0 success, 1 refused or failed, 2 wrong usage.
 `;
 
 const TEMPLATE = `{
+  "//dialect": "mysql | postgres | sqlite. For sqlite, replace connection with {\\"file\\": \\"app.db\\"} — no server and no password. Node 24+.",
   "dialect": "postgres",
 
   "connection": {
@@ -224,7 +226,7 @@ async function run(args: Args): Promise<number> {
       if (sql.trim() === '') throw new UsageError('Nothing to read. Pass a SELECT statement.');
       return withSession(cfg, async (s) => {
         const r = await s.engine.read(sql, args.limit === undefined ? {} : { limit: args.limit });
-        out(JSON.stringify(r.rows, null, 2));
+        out(JSON.stringify(r.rows, displayReplacer, 2));
         out(r.truncated ? `-- TRUNCATED at ${r.rows.length} rows; there are more.` : `-- ${r.rows.length} row(s)`);
         return 0;
       });

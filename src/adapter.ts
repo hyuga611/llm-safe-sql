@@ -23,6 +23,22 @@ export interface Adapter {
   readonly dialect: Dialect;
 
   /**
+   * Guarantees this adapter cannot make, phrased for the person approving a plan.
+   *
+   * Empty for an engine that can honour all four assumptions above. When it is
+   * not empty the engine copies these onto every confirmation card, because the
+   * alternative is the failure this file was written to prevent: a limit that is
+   * documented, silently unenforced, and therefore believed. The reference
+   * implementation set a statement timeout with a MySQL optimizer hint that
+   * Postgres parsed as a comment — nothing warned anybody, and the limit simply
+   * did not exist there for a year.
+   *
+   * Say what is not enforced and what the reader should do instead. Do not put
+   * anything here that could be enforced with more work; fix it instead.
+   */
+  readonly limitations: readonly string[];
+
+  /**
    * Verify the environment before anything is allowed to run, and throw if the
    * engine's guarantees cannot hold here.
    *
@@ -134,6 +150,24 @@ export interface Adapter {
   ): Promise<{ rowsMatched: number; rowsChanged: number; changedIsMeaningful: boolean }>;
 
   quoteIdent(name: string): string;
+
+  /**
+   * The clause that makes a SELECT hold its rows until the transaction ends.
+   *
+   * The apply step reads the target rows and checks they still match the plan
+   * before writing. Without a lock there is a gap between that check and the
+   * write in which another session can change the row, and the whole point of
+   * the check is to close that gap.
+   *
+   * `' FOR UPDATE'` on MySQL and Postgres. Empty on SQLite, which has no row
+   * locks at all — a write transaction there locks the entire database, so the
+   * adapter takes that lock at `begin()` instead and the gap never opens. This
+   * is a method rather than a constant because returning the wrong answer here
+   * is not a syntax error on every engine: appending `FOR UPDATE` on SQLite
+   * throws, but *omitting* it on Postgres runs perfectly and silently drops the
+   * guarantee.
+   */
+  rowLockClause(): string;
 
   close(): Promise<void>;
 }

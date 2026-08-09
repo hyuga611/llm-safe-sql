@@ -87,8 +87,11 @@ measurement won and the test records what was observed, on which version.
 |---|---|---|
 | E1 | Refuse persistent connections and transaction-pooling proxies | A dry run can otherwise be left open on a connection handed to another caller |
 | E2 🔬 | Probe **both halves** of what "rows affected" means: that a same-value update reports 0 changed, *and* that it reports 1 matched | It is configurable (`CLIENT_FOUND_ROWS`), and every reconciliation depends on the answer. Checking only the first half passes whether or not the flag is set — so the number the adapter calls "matched" was never verified to be a count of matches, and the check meant to catch "rows changed that you were never shown" would be comparing a value against itself |
-| E3 🔬 | Set timeouts as real session settings, never as an optimizer hint. Refuse to start if the dialect has no equivalent | A hint other engines parse as a comment is not a limit |
+| E3 🔬 | Set timeouts as real session settings, never as an optimizer hint. Where the engine has no equivalent, the adapter must **declare** the gap under E5 rather than accept the setting and drop it | A hint other engines parse as a comment is not a limit. Silently accepting a limit you cannot enforce is the same failure with better manners |
 | E4 | Savepoint names must be unique per call, and released on success | A fixed name lets a second nested call silently redefine the first one's scope |
+| E5 | An adapter must list every guarantee it cannot make, and the engine must copy that list onto **every** confirmation card | A limitation recorded once in a README is indistinguishable, to the person approving, from a limitation that does not exist. SQLite has no statement timeout at all; saying so on the card is the difference between a known trade and an ambush |
+| E6 🔬 | Probe that a rollback really undid the write, against the real database rather than a temporary table | `PRAGMA journal_mode = OFF` on SQLite, and a non-transactional storage engine on MySQL, both accept a `ROLLBACK`, report success, and keep the change. A probe on scratch storage can pass while the target cannot be rolled back |
+| E7 | A connection declared read-only must be **proven** read-only by attempting a write | On SQLite the read/write split is a file handle rather than a credential. A flag that is wrong is worse than no flag, because the deployment is relying on it |
 
 ## 6. Reads
 
@@ -109,28 +112,42 @@ measurement won and the test records what was observed, on which version.
 
 ## Dialect notes
 
-Measured on **MySQL 8.4.11** (InnoDB, REPEATABLE READ) and **PostgreSQL 16.14**.
-Each row is pinned by a test, so a future version that changes the answer will
-tell us.
+Measured on **MySQL 8.4.11** (InnoDB, REPEATABLE READ), **PostgreSQL 16.14** and
+**SQLite via `node:sqlite`** (Node 24). Each row is pinned by a test, so a future
+version that changes the answer will tell us.
 
-| Behaviour | MySQL | PostgreSQL |
-|---|---|---|
-| DDL inside a transaction | Commits implicitly — a trial run cannot be undone, so DDL is refused at any setting | Transactional, so DDL may be opted into |
-| Statement timeout on a **write** | **None.** `max_execution_time` applies to read-only `SELECT` only | `statement_timeout` applies and raises |
-| A statement cut short by the timeout | Can return **success** with no error | Raises |
-| "Rows affected" | `affectedRows` = matched, `changedRows` = really changed | `rowCount` counts rows written; a same-value update still counts |
-| Row locks after `ROLLBACK TO SAVEPOINT`, savepoint set first | Released | Released |
-| Row locks after `ROLLBACK TO SAVEPOINT`, **caller wrote first** | **Retained** until the outer transaction ends | Released |
-| Columns the database maintains | Declarative (`ON UPDATE`), so knowable — unless a trigger exists | Never declarative; conventionally a trigger, so knowable only when no trigger exists |
-| Sub-millisecond timestamps by default | `DATETIME(6)` parsed to a `Date`: microseconds lost | `timestamp(6)` parsed to a `Date`: microseconds lost |
-| Zero dates | `0000-00-00` is storable under a legacy `sql_mode`, and parsed to `1899-11-30` | not representable |
+| Behaviour | MySQL | PostgreSQL | SQLite |
+|---|---|---|---|
+| DDL inside a transaction | Commits implicitly — a trial run cannot be undone, so DDL is refused at any setting | Transactional, so DDL may be opted into | Transactional |
+| Statement timeout on a **write** | **None.** `max_execution_time` applies to read-only `SELECT` only | `statement_timeout` applies and raises | **None at all.** `node:sqlite` exposes no interrupt; declared under E5 |
+| A statement cut short by the timeout | Can return **success** with no error | Raises | n/a |
+| Lock wait bound | `innodb_lock_wait_timeout` | `lock_timeout` | `PRAGMA busy_timeout` |
+| "Rows affected" | `affectedRows` = matched, `changedRows` = really changed | `rowCount` counts rows written; a same-value update still counts | `changes` counts rows written; a same-value update still counts |
+| Row locks after `ROLLBACK TO SAVEPOINT`, savepoint set first | Released | Released | No row locks exist |
+| Row locks after `ROLLBACK TO SAVEPOINT`, **caller wrote first** | **Retained** until the outer transaction ends | Released | No row locks exist |
+| Locking read for the apply | `FOR UPDATE` | `FOR UPDATE` | Not supported. `BEGIN IMMEDIATE` takes a whole-database write lock instead |
+| Columns the database maintains | Declarative (`ON UPDATE`), so knowable — unless a trigger exists | Never declarative; conventionally a trigger, so knowable only when no trigger exists | Never declarative; same as PostgreSQL |
+| Sub-millisecond timestamps by default | `DATETIME(6)` parsed to a `Date`: microseconds lost | `timestamp(6)` parsed to a `Date`: microseconds lost | No date type; stored as text or integer |
+| 64-bit integers | Arrive as strings (`bigNumberStrings`) | Arrive as strings | Arrive as **`bigint`**; as JS numbers they would collide above 2^53 |
+| Zero dates | `0000-00-00` is storable under a legacy `sql_mode`, and parsed to `1899-11-30` | not representable | n/a |
+| Quoted identifiers | `` `x` `` and `"x"` under `ANSI_QUOTES` | `"x"` | `"x"`, `` `x` `` **and** `[x]` — all three |
+| Backslash in a string literal | An escape | Literal | Literal |
+| `--` needs trailing whitespace | Yes | No | No |
 
-Two consequences worth stating plainly:
+Consequences worth stating plainly:
 
 - On MySQL there is **no statement timeout for writes**, so the row ceiling and
   the lock timeout are not optional there — they are the only bounds that exist.
+  On SQLite there is no statement timeout at all, which is why E5 exists.
 - Testing savepoint locks only in the shape where the savepoint comes first
   yields the comfortable and wrong conclusion that locks are always released.
+- SQLite accepts three spellings of a quoted identifier. A lexer that knows only
+  two reads a different statement than the engine executes, and a denylist that
+  inspects identifiers is then inspecting the wrong text.
+- SQLite is the only adapter that returns a real `bigint`, which is why `keyOf`
+  encodes values before hashing them: `JSON.stringify` throws on a `bigint`
+  rather than degrading, and the other two engines had hidden that by returning
+  their 64-bit ids as strings.
 
 ---
 

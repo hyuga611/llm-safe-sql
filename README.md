@@ -92,10 +92,62 @@ The sentence under **What this touches** is required configuration. Without it a
 non-engineer is being shown column names and asked to judge them, which they
 cannot do — so a table with no declared consequence cannot be written at all.
 
+## Try it without setting up a database
+
+SQLite ships inside Node, so there is no server, no container and no credential
+to arrange. Copy this and watch the rollback happen to a real file.
+
+```bash
+mkdir demo && cd demo && npm install @hyuga/llm-safe-sql
+
+cat > seed.mjs <<'EOF'
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync('app.db');
+db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, ref TEXT NOT NULL, status TEXT NOT NULL)");
+db.exec("INSERT INTO orders VALUES (1,'R-1','packed'),(2,'R-2','packed'),(3,'R-3','shipped')");
+EOF
+node seed.mjs
+
+cat > llm-safe-sql.config.json <<'JSON'
+{
+  "dialect": "sqlite",
+  "connection": { "file": "app.db" },
+  "policy": {
+    "allow": ["orders"],
+    "impact": { "orders": "Marking an order shipped emails the customer." }
+  }
+}
+JSON
+
+npx llm-safe-sql check
+npx llm-safe-sql migrate
+npx llm-safe-sql plan "UPDATE orders SET status='shipped' WHERE status='packed'"
+```
+
+The card that comes back names the two rows and the values they would move
+between. Then check the table:
+
+```bash
+node -e "const{DatabaseSync}=require('node:sqlite');
+console.log(new DatabaseSync('app.db').prepare('SELECT id,status FROM orders').all())"
+# id 1 and 2 are still 'packed'
+```
+
+The statement really ran. The values on the card were read back out of the
+database after it ran. And the rows are still as they were, because the
+transaction was rolled back — which is the entire claim, demonstrated in about a
+minute on a file you can delete afterwards.
+
+`npx llm-safe-sql approve <id> --as you@example.com` and then `apply` will
+commit it, and only then does anything change.
+
+**Requires Node 24 or later** (`node:sqlite` ships unflagged from Node 23.4).
+MySQL and PostgreSQL work on Node 20+.
+
 ## Quick start
 
 ```bash
-npm install @hyuga/llm-safe-sql pg        # or: mysql2
+npm install @hyuga/llm-safe-sql pg        # or: mysql2, or nothing at all for sqlite
 npx llm-safe-sql init > llm-safe-sql.config.json
 $EDITOR llm-safe-sql.config.json          # name your tables and what they mean
 export LLM_SAFE_SQL_PASSWORD=…
@@ -207,17 +259,27 @@ Facts marked 🔬 in [SPEC.md](SPEC.md) were established by measuring MySQL 8.4.
 and PostgreSQL 16.14 in CI, not by reading documentation. Where measurement
 contradicted the docs, the measurement won. A few that change how this is built:
 
-| | MySQL | PostgreSQL |
-|---|---|---|
-| Statement timeout on a **write** | **None** — `max_execution_time` is read-only statements only | `statement_timeout` applies |
-| A statement cut short by a timeout | can return **success** | raises |
-| Row locks after `ROLLBACK TO SAVEPOINT`, when the caller wrote first | **retained** to end of transaction | released |
-| DDL in a transaction | commits implicitly | transactional |
+| | MySQL | PostgreSQL | SQLite |
+|---|---|---|---|
+| Statement timeout on a **write** | **None** — `max_execution_time` is read-only statements only | `statement_timeout` applies | **None at all** — said on every card |
+| A statement cut short by a timeout | can return **success** | raises | n/a |
+| Row locks after `ROLLBACK TO SAVEPOINT`, when the caller wrote first | **retained** to end of transaction | released | no row locks exist |
+| DDL in a transaction | commits implicitly | transactional | transactional |
+| "rows affected" can mean "rows changed" | yes | no | no |
+| 64-bit integers arrive as | strings | strings | `bigint` |
 
-The middle row is why a dry run always gets its own connection: nested inside
+The third row is why a dry run always gets its own connection: nested inside
 your transaction, on MySQL, it would hold exclusive locks on rows it only
 pretended to touch. Testing only the easy shape — savepoint first, then write —
 gives the comfortable and wrong answer that locks are always released.
+
+SQLite has no row locks to retain, so it takes the whole-database write lock up
+front with `BEGIN IMMEDIATE` instead; that is what makes the apply's
+check-then-write atomic without a `FOR UPDATE` to append. Its missing statement
+timeout is not hidden in this table — the adapter declares it and the engine
+prints it as a warning on every confirmation card, because a limit that is
+configured, believed and absent is the exact failure this library was built
+after.
 
 ## Dependencies
 
@@ -288,10 +350,60 @@ JSONB・配列・バイナリの全列と、ドライバが浮動小数で返す
 できない別プロセスにあるから**です。OS ユーザーも DB アカウントも分けられるので、
 この分離はこのライブラリにバグがあっても成立します。
 
+## DB を用意せずに試す
+
+SQLite は Node に内蔵されているので、サーバもコンテナも認証情報も要りません。
+下をそのまま貼れば、**実ファイルに対してロールバックが起きるところ**が見られます。
+
+```bash
+mkdir demo && cd demo && npm install @hyuga/llm-safe-sql
+
+cat > seed.mjs <<'EOF'
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync('app.db');
+db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, ref TEXT NOT NULL, status TEXT NOT NULL)");
+db.exec("INSERT INTO orders VALUES (1,'R-1','packed'),(2,'R-2','packed'),(3,'R-3','shipped')");
+EOF
+node seed.mjs
+
+cat > llm-safe-sql.config.json <<'JSON'
+{
+  "dialect": "sqlite",
+  "connection": { "file": "app.db" },
+  "policy": {
+    "allow": ["orders"],
+    "impact": { "orders": "出荷済みにすると顧客にメールが飛びます。" }
+  }
+}
+JSON
+
+npx llm-safe-sql check
+npx llm-safe-sql migrate
+npx llm-safe-sql plan "UPDATE orders SET status='shipped' WHERE status='packed'"
+```
+
+確認カードに、2 行がどの値からどの値に変わるかが出ます。そのうえで中身を見てください。
+
+```bash
+node -e "const{DatabaseSync}=require('node:sqlite');
+console.log(new DatabaseSync('app.db').prepare('SELECT id,status FROM orders').all())"
+# id 1 と 2 は 'packed' のままです
+```
+
+**SQL は本当に実行されました。** カードの値は、実行した後のデータベースから読み出した
+ものです。それでも行は元のままです——ロールバックしたからです。これがこのライブラリの
+主張のすべてで、消してよいファイル 1 つで 1 分あれば確認できます。
+
+`npx llm-safe-sql approve <id> --as you@example.com` のあと `apply` して、
+そこで初めてデータが変わります。
+
+**Node 24 以降が必要**です（`node:sqlite` は Node 23.4 からフラグ無しで使えます）。
+MySQL と PostgreSQL は Node 20 以降で動きます。
+
 ## 使い方
 
 ```bash
-npm install @hyuga/llm-safe-sql pg        # または mysql2
+npm install @hyuga/llm-safe-sql pg        # または mysql2、sqlite なら追加インストール不要
 npx llm-safe-sql init > llm-safe-sql.config.json
 # 設定ファイルに「触れてよいテーブル」と「そのテーブルを変えると業務上どうなるか」を書く
 export LLM_SAFE_SQL_PASSWORD=…
@@ -345,16 +457,31 @@ allowlist 外のテーブル、`INSERT`、`WHERE` なし、`JOIN`・複数テー
 [SPEC.md](SPEC.md) の 🔬 印は、ドキュメントではなく MySQL 8.4.11 と PostgreSQL 16.14 を
 CI 上で実測して確定した事実です。ドキュメントと食い違った場合は実測を採用しています。
 
-| | MySQL | PostgreSQL |
-|---|---|---|
-| **書き込み**の実行時間制限 | **無い**（`max_execution_time` は SELECT 専用） | `statement_timeout` が効く |
-| タイムアウトで切られた文 | **成功**として返りうる | エラーになる |
-| 先に書いてから張った SAVEPOINT のロールバック後の行ロック | **保持されたまま** | 解放される |
-| トランザクション内の DDL | 暗黙コミット | トランザクショナル |
+| | MySQL | PostgreSQL | SQLite |
+|---|---|---|---|
+| **書き込み**の実行時間制限 | **無い**（`max_execution_time` は SELECT 専用） | `statement_timeout` が効く | **そもそも無い**（カードに毎回明記） |
+| タイムアウトで切られた文 | **成功**として返りうる | エラーになる | 該当なし |
+| 先に書いてから張った SAVEPOINT のロールバック後の行ロック | **保持されたまま** | 解放される | 行ロックが存在しない |
+| トランザクション内の DDL | 暗黙コミット | トランザクショナル | トランザクショナル |
+| 「影響行数」が「変更行数」を意味しうるか | する | しない | しない |
+| 64bit 整数の受け取り型 | 文字列 | 文字列 | `bigint` |
 
 3 行目が、試走に必ず専用接続を与える理由です。あなたのトランザクションの内側で走らせると、
 MySQL では「触ったふりをしただけの行」に排他ロックが残ります。SAVEPOINT を先に張る
 簡単な形だけを試すと「ロックは常に解放される」という**心地よく間違った**結論が出ます。
+
+SQLite には保持される行ロックがありません。代わりに `BEGIN IMMEDIATE` で
+**DB 全体の書き込みロックを最初に取る**ので、`FOR UPDATE` を付けなくても
+「確認してから書く」が不可分になります。実行時間制限が無いことは表の中に埋めず、
+アダプタが自己申告し、エンジンが**確認カードに毎回警告として印字**します。
+設定されていて、信じられていて、実は効いていない制限——それがこのライブラリを
+作るきっかけになった不具合そのものだからです。
+
+なお SQLite は 64bit 整数を `bigint` で返します。JS の数値は 53bit しか持てないため、
+`9223372036854775806` と `9223372036854775807` は数値にすると**同じ値**になります。
+そこだけが違う更新は「変化なし」と判定されてカードから消えます。これは
+マイクロ秒のタイムスタンプをミリ秒の `Date` で読んでいた既知の不具合と同じ形なので、
+テストで固定してあります。
 
 ## 依存
 

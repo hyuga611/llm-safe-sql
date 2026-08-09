@@ -69,6 +69,75 @@ jobs:
       - name: Integration tests (MySQL 8.4 + PostgreSQL 16)
         run: npm run test:integration
 
+  # The README promises SQLite works with no server, no container and no driver.
+  # That is a claim about a freshly installed package on a clean machine, which
+  # the repository's own node_modules cannot demonstrate — so it is checked here,
+  # from the tarball, with nothing else installed.
+  sqlite-no-driver:
+    name: sqlite with no driver installed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.x'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      - name: Install the tarball with no database driver at all
+        run: |
+          TARBALL=$(npm pack --silent)
+          mkdir -p /tmp/sqlite-demo && cd /tmp/sqlite-demo
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$TARBALL" >/dev/null
+          test ! -d node_modules/pg     || (echo 'pg should not be here' && exit 1)
+          test ! -d node_modules/mysql2 || (echo 'mysql2 should not be here' && exit 1)
+
+      # Exactly the commands in the README's "Try it without setting up a
+      # database" section. If that section rots, this fails.
+      - name: Run the documented quick start
+        working-directory: /tmp/sqlite-demo
+        run: |
+          cat > seed.mjs <<'EOF'
+          import { DatabaseSync } from 'node:sqlite';
+          const db = new DatabaseSync('app.db');
+          db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, ref TEXT NOT NULL, status TEXT NOT NULL)");
+          db.exec("INSERT INTO orders VALUES (1,'R-1','packed'),(2,'R-2','packed'),(3,'R-3','shipped')");
+          EOF
+          node seed.mjs
+
+          cat > llm-safe-sql.config.json <<'JSON'
+          {
+            "dialect": "sqlite",
+            "connection": { "file": "app.db" },
+            "policy": {
+              "allow": ["orders"],
+              "impact": { "orders": "Marking an order shipped emails the customer." }
+            }
+          }
+          JSON
+
+          npx llm-safe-sql check
+          npx llm-safe-sql migrate
+          npx llm-safe-sql plan "UPDATE orders SET status='shipped' WHERE status='packed'"
+
+      # The claim is not that the command exits 0 — it is that the database is
+      # untouched afterwards. Assert that, not the exit code.
+      - name: The dry run must have left the rows alone
+        working-directory: /tmp/sqlite-demo
+        run: |
+          node --input-type=module -e "
+            import { DatabaseSync } from 'node:sqlite';
+            const rows = new DatabaseSync('app.db').prepare('SELECT id, status FROM orders ORDER BY id').all();
+            const got = rows.map((r) => r.id + '=' + r.status).join(' ');
+            console.log('after the dry run:', got);
+            if (got !== '1=packed 2=packed 3=shipped') {
+              console.error('the dry run was NOT rolled back');
+              process.exit(1);
+            }
+          "
+
   package:
     name: package contents
     runs-on: ubuntu-latest

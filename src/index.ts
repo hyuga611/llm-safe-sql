@@ -65,7 +65,14 @@ export type {
 //
 // Or let the configuration pick, which loads the driver on demand:
 export { connectAdapter, loadConfig, parseConfig, policyOf, ConfigError } from './config.js';
-export type { Config, ConnectionConfig, LimitsConfig } from './config.js';
+export type {
+  Config,
+  ConnectionConfig,
+  ServerConnectionConfig,
+  SqliteConnectionConfig,
+  LimitsConfig,
+} from './config.js';
+export { isSqliteConnection } from './config.js';
 export { openReadSession, openAdminSession } from './session.js';
 export type { ReadSession, AdminSession } from './session.js';
 export { planCard, planBody } from './card.js';

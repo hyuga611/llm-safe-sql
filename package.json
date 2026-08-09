@@ -18,6 +18,10 @@
       "types": "./dist/src/adapters/postgres.d.ts",
       "default": "./dist/src/adapters/postgres.js"
     },
+    "./sqlite": {
+      "types": "./dist/src/adapters/sqlite.d.ts",
+      "default": "./dist/src/adapters/sqlite.js"
+    },
     "./mcp": {
       "types": "./dist/src/mcp/server.d.ts",
       "default": "./dist/src/mcp/server.js"
@@ -58,6 +62,7 @@
     "human-in-the-loop",
     "dry-run",
     "rollback",
+    "sqlite",
     "mysql",
     "postgresql",
     "ai-safety",

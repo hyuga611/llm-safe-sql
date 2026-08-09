@@ -23,12 +23,35 @@ export class ConfigError extends Refusal {
   }
 }
 
-export interface ConnectionConfig {
+export interface ServerConnectionConfig {
   readonly host: string;
   readonly port: number;
   readonly user: string;
   readonly password: string;
   readonly database: string;
+}
+
+/**
+ * A SQLite database is a file, so there is no credential to separate.
+ *
+ * That matters for the plan/apply split this library is built around. On MySQL
+ * and Postgres you point `applyConnection` at a different database user and the
+ * separation stops depending on this library being correct. Here the equivalent
+ * is `readOnly`: the model side opens the file read-only and SQLite itself
+ * refuses every write on that handle, whatever the policy layer does or fails to
+ * do. It is a weaker boundary than a separate credential — the process can still
+ * open a second, writable handle — but it is enforced by the engine rather than
+ * by us, which is more than a shared credential gives you.
+ */
+export interface SqliteConnectionConfig {
+  readonly file: string;
+  readonly readOnly?: boolean;
+}
+
+export type ConnectionConfig = ServerConnectionConfig | SqliteConnectionConfig;
+
+export function isSqliteConnection(c: ConnectionConfig): c is SqliteConnectionConfig {
+  return typeof (c as SqliteConnectionConfig).file === 'string';
 }
 
 export interface LimitsConfig {
@@ -83,11 +106,36 @@ function expand(value: unknown, path: string, env: NodeJS.ProcessEnv): unknown {
   return value;
 }
 
-function connectionOf(raw: unknown, path: string): ConnectionConfig {
+function connectionOf(raw: unknown, path: string, dialect: Dialect): ConnectionConfig {
   if (raw === null || typeof raw !== 'object') {
-    throw new ConfigError(`${path} must be an object with host, port, user, password and database.`);
+    throw new ConfigError(
+      dialect === 'sqlite'
+        ? `${path} must be an object with a file path, e.g. {"file": "./app.db"}.`
+        : `${path} must be an object with host, port, user, password and database.`,
+    );
   }
   const o = raw as Record<string, unknown>;
+
+  if (dialect === 'sqlite') {
+    if (typeof o['file'] !== 'string' || o['file'] === '') {
+      throw new ConfigError(`${path}.file must be a path to a SQLite database file.`);
+    }
+    // ':memory:' is refused rather than quietly accepted. Each connection gets its
+    // own private in-memory database, so the plan written by one process would be
+    // invisible to the process approving it — every plan would come back "not
+    // found", with nothing to suggest why.
+    if (o['file'] === ':memory:') {
+      throw new ConfigError(
+        `${path}.file cannot be ":memory:". An in-memory database is private to a single connection, so a ` +
+          'plan created here could never be read back by the process that applies it. Use a file path.',
+      );
+    }
+    return {
+      file: String(o['file']),
+      ...(o['readOnly'] === undefined ? {} : { readOnly: Boolean(o['readOnly']) }),
+    };
+  }
+
   for (const k of ['host', 'user', 'database']) {
     if (typeof o[k] !== 'string' || o[k] === '') throw new ConfigError(`${path}.${k} must be a non-empty string.`);
   }
@@ -106,11 +154,11 @@ export function parseConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env):
   const cfg = expand(raw, 'config', env) as Record<string, unknown>;
 
   const dialect = cfg['dialect'];
-  if (dialect !== 'mysql' && dialect !== 'postgres') {
-    throw new ConfigError('config.dialect must be "mysql" or "postgres".');
+  if (dialect !== 'mysql' && dialect !== 'postgres' && dialect !== 'sqlite') {
+    throw new ConfigError('config.dialect must be "mysql", "postgres" or "sqlite".');
   }
 
-  const connection = connectionOf(cfg['connection'], 'config.connection');
+  const connection = connectionOf(cfg['connection'], 'config.connection', dialect);
 
   const p = (cfg['policy'] ?? {}) as Record<string, unknown>;
   const allow = p['allow'];
@@ -146,10 +194,10 @@ export function parseConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env):
     connection,
     ...(cfg['applyConnection'] === undefined
       ? {}
-      : { applyConnection: connectionOf(cfg['applyConnection'], 'config.applyConnection') }),
+      : { applyConnection: connectionOf(cfg['applyConnection'], 'config.applyConnection', dialect) }),
     ...(cfg['storeConnection'] === undefined
       ? {}
-      : { storeConnection: connectionOf(cfg['storeConnection'], 'config.storeConnection') }),
+      : { storeConnection: connectionOf(cfg['storeConnection'], 'config.storeConnection', dialect) }),
     policy,
     ...(cfg['limits'] === undefined ? {} : { limits: cfg['limits'] as LimitsConfig }),
     ...(cfg['autoColumns'] === undefined
@@ -188,6 +236,16 @@ export function policyOf(cfg: Config): Policy {
  */
 export async function connectAdapter(dialect: Dialect, conn: ConnectionConfig): Promise<Adapter> {
   try {
+    if (dialect === 'sqlite') {
+      if (!isSqliteConnection(conn)) {
+        throw new ConfigError('A sqlite connection needs a "file" path, not host/port/user.');
+      }
+      const { SqliteAdapter } = await import('./adapters/sqlite.js');
+      return SqliteAdapter.connect(conn);
+    }
+    if (isSqliteConnection(conn)) {
+      throw new ConfigError(`A ${dialect} connection needs host, port, user, password and database — not "file".`);
+    }
     if (dialect === 'mysql') {
       const { MysqlAdapter } = await import('./adapters/mysql.js');
       return await MysqlAdapter.connect(conn);
@@ -195,6 +253,7 @@ export async function connectAdapter(dialect: Dialect, conn: ConnectionConfig): 
     const { PostgresAdapter } = await import('./adapters/postgres.js');
     return await PostgresAdapter.connect(conn);
   } catch (e) {
+    if (e instanceof ConfigError) throw e;
     const driver = dialect === 'mysql' ? 'mysql2' : 'pg';
     if (String(e).includes('ERR_MODULE_NOT_FOUND') || String(e).includes(`Cannot find package '${driver}'`)) {
       throw new ConfigError(`The ${driver} driver is not installed. Run: npm install ${driver}`);

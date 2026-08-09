@@ -169,3 +169,82 @@ test('lex: raw slices reassemble into the original input exactly', () => {
     }
   }
 });
+
+// =====================================================================
+//  SPEC N2/R2 -- SQLite.
+//
+//   SQLite accepts THREE spellings of a quoted identifier: "x" like the
+//   standard, `x` like MySQL, and [x] like MS Access. Every one of them was
+//   confirmed against a real database before these tests were written, because
+//   the risk here is specific: if SQLite reads `[users]` as one identifier and
+//   this lexer reads it as punctuation around a bare word, then a denylist that
+//   inspects identifiers is looking at a different statement than the one that
+//   will run. Agreement with the engine is the whole job.
+// =====================================================================
+
+test('N2: SQLite needs no whitespace after -- , like Postgres and unlike MySQL', () => {
+  assert.equal(stripComments('SELECT 5--3', 'sqlite').trim(), 'SELECT 5');
+  assert.equal(stripComments('SELECT 5--3', 'mysql'), 'SELECT 5--3');
+});
+
+test('N2: # is NOT a comment in SQLite', () => {
+  assert.equal(stripComments('SELECT 1 # hidden', 'sqlite'), 'SELECT 1 # hidden');
+});
+
+test('N2: SQLite block comments do not nest', () => {
+  // The inner `*/` closes it, so `c */ 1` is live SQL — same as MySQL.
+  assert.equal(
+    stripComments('SELECT /* a /* b */ c */ 1', 'sqlite').replace(/\s+/g, ' ').trim(),
+    'SELECT c */ 1',
+  );
+});
+
+test('R2: all three SQLite identifier quotings surface the same name', () => {
+  for (const sql of [
+    'UPDATE "AdminUser" SET a=1',
+    'UPDATE `AdminUser` SET a=1',
+    'UPDATE [AdminUser] SET a=1',
+    'UPDATE AdminUser SET a=1',
+  ]) {
+    assert.ok(identifiers(sql, 'sqlite').includes('adminuser'), sql);
+  }
+});
+
+test('R2: a bracketed name inside a string literal is NOT an identifier', () => {
+  const ids = identifiers("UPDATE t SET note='see [AdminUser] for details' WHERE id=1", 'sqlite');
+  assert.ok(!ids.includes('adminuser'), 'a denylist must not fire on prose');
+});
+
+test('R2: SQLite does not honour backslash escapes in strings, so the literal ends at the quote', () => {
+  // In MySQL the backslash escapes the quote and the literal swallows the rest;
+  // in SQLite it does not, so `AdminUser` really is an identifier here.
+  const ids = identifiers("UPDATE t SET a='x\\' WHERE b=AdminUser", 'sqlite');
+  assert.ok(ids.includes('adminuser'));
+});
+
+test('R2: a double-quoted name is an identifier in SQLite, not a string', () => {
+  const toks = lex('SELECT "col" FROM t', 'sqlite');
+  assert.equal(toks.find((t) => t.value === 'col')?.kind, 'quotedIdent');
+  // In MySQL's default sql_mode the same text is a string literal.
+  assert.equal(lex('SELECT "col" FROM t', 'mysql').find((t) => t.value === 'col')?.kind, 'string');
+});
+
+test('lex: an unterminated [ is refused rather than guessed at', () => {
+  assert.throws(() => lex('SELECT * FROM [oops', 'sqlite'), /unterminated/i);
+});
+
+test('lex: SQLite raw slices reassemble into the original input exactly', () => {
+  const samples = [
+    'UPDATE [Order] SET shipDate=\'2026-08-08\' WHERE ref=`R-1` -- note\n',
+    'SELECT /* c */ a, "b" FROM t WHERE x=1',
+    "SELECT 5--3, 'it''s' FROM t",
+  ];
+  for (const s of samples) {
+    assert.equal(
+      lex(s, 'sqlite')
+        .map((t) => t.raw)
+        .join(''),
+      s,
+    );
+  }
+});

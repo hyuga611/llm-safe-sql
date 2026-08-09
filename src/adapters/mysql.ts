@@ -18,6 +18,8 @@ export class AdapterUnusable extends Error {
 
 export class MysqlAdapter implements Adapter {
   readonly dialect = 'mysql' as const;
+  /** `max_execution_time` and `innodb_lock_wait_timeout` are both real here, so there is nothing to disclaim. */
+  readonly limitations: readonly string[] = [];
   private readonly conn: mysql.Connection;
   private open = false;
   private savepoints = 0;
@@ -283,6 +285,10 @@ export class MysqlAdapter implements Adapter {
 
   quoteIdent(name: string): string {
     return '`' + name.replace(/`/g, '``') + '`';
+  }
+
+  rowLockClause(): string {
+    return ' FOR UPDATE';
   }
 
   async close(): Promise<void> {

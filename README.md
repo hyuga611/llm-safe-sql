@@ -3,14 +3,14 @@
 [![CI](https://github.com/hyuga611/llm-safe-sql/actions/workflows/ci.yml/badge.svg)](https://github.com/hyuga611/llm-safe-sql/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@hyuga/llm-safe-sql.svg)](https://www.npmjs.com/package/@hyuga/llm-safe-sql)
 
+*[日本語は下にあります](#日本語)*
+
 **Let a language model propose an `UPDATE` or `DELETE`. Run it for real inside a
 transaction, measure the actual before/after values, and always roll back. Show a
 human the measurement. Only then, on their word, do it for real.**
 
 The confirmation is not a prediction and not a summary the model wrote. It is
 what the database itself did when the statement ran.
-
-*[日本語は下にあります](#日本語)*
 
 ---
 

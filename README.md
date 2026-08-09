@@ -293,6 +293,8 @@ None of this makes the in-process guards pointless. They catch the ordinary
 mistakes, and they produce the explanations. But when the two disagree, the
 database wins, and it should.
 
+There is a longer write-up of this idea, covering how the other tools in this space answer the same question: **[Which layer is actually stopping it?](https://github.com/hyuga611/llm-safe-sql/discussions/3)**
+
 ## Measured, not assumed
 
 Facts marked 🔬 in [SPEC.md](SPEC.md) were established by measuring MySQL 8.4.11

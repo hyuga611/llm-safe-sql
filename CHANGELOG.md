@@ -41,6 +41,19 @@ All notable changes to this project are documented here. The format follows
   table with an integer primary key. Values now go through the same envelope the
   plan is stored with, so a key built from a live row and a key built from a
   decoded snapshot are built the same way.
+- **A PostgreSQL-only installation could not connect at all**, and had not been
+  able to since 0.1.0. `AdapterUnusable` was defined in the MySQL adapter and
+  imported by the Postgres one, so loading Postgres loaded `mysql2` — and the
+  error it produced was *"The pg driver is not installed. Run: npm install pg"*
+  with `pg` already in `node_modules`, sending the reader to reinstall the one
+  thing that was not the problem. The shared error class now lives in the module
+  that has no driver imports, and no adapter imports another. CI's existing
+  "one driver installed" check missed this because it only imported the package
+  root, which deliberately loads no adapter; it now opens a connection.
+- `connectAdapter` no longer guesses which package is missing from the dialect.
+  It reads the specifier out of the error, so the name it reports cannot drift
+  from what actually failed to load, and an unrecognisable one rethrows the
+  original rather than replacing it with a confident wrong answer.
 - `llm-safe-sql read` crashed on any row containing a 64-bit integer, for the
   same reason and in the same place. The CLI and the MCP server now share one
   replacer, so the model and the human reading the same row see the same text;

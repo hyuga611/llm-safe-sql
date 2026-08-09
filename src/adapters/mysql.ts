@@ -1,5 +1,8 @@
 import mysql from 'mysql2/promise';
 import type { Adapter, ColumnShape, Row, Savepoint, TableShape } from '../adapter.js';
+import { AdapterUnusable } from '../adapter.js';
+
+export { AdapterUnusable };
 
 export interface MysqlConfig {
   host: string;
@@ -7,13 +10,6 @@ export interface MysqlConfig {
   user: string;
   password: string;
   database: string;
-}
-
-export class AdapterUnusable extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'AdapterUnusable';
-  }
 }
 
 export class MysqlAdapter implements Adapter {

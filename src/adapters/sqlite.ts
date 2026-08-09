@@ -1,5 +1,5 @@
 import type { Adapter, ColumnShape, InboundCascade, Row, Savepoint, TableShape } from '../adapter.js';
-import { AdapterUnusable } from './mysql.js';
+import { AdapterUnusable } from '../adapter.js';
 
 export { AdapterUnusable };
 

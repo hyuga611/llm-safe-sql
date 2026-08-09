@@ -39,7 +39,18 @@ const CONFIG = {
   limits: { maxUpdateRows: 10, maxDeleteRows: 5, maxReadRows: 5 },
 };
 
-const env = { ...process.env, E2E_PASSWORD: PG.password, LLM_SAFE_SQL_CONFIG: '' };
+/**
+ * The environment the two programs are started with.
+ *
+ * `NODE_TEST_CONTEXT` and `NODE_TEST_WORKER_ID` are set by the test runner in
+ * this process and must not be passed on. A process started with them believes
+ * it is a test worker and can write the runner's own reporting frames to stdout —
+ * and one of the two programs started here is an MCP server whose protocol *is*
+ * stdout. Inheriting the whole environment is right for everything else; these
+ * two are the runner talking to itself.
+ */
+const { NODE_TEST_CONTEXT: _ctx, NODE_TEST_WORKER_ID: _worker, ...inherited } = process.env;
+const env = { ...inherited, E2E_PASSWORD: PG.password, LLM_SAFE_SQL_CONFIG: '' };
 
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), 'llm-safe-sql-e2e-'));
@@ -61,18 +72,67 @@ interface Ran {
   code: number;
   stdout: string;
   stderr: string;
+  signal: NodeJS.Signals | null;
+  spawnError: string | null;
+  /** Everything known about the run, for an assertion message that is worth reading. */
+  report(): string;
 }
 
-function cli(...args: string[]): Promise<Ran> {
+/**
+ * Run the CLI as a separate process, and keep enough about the run to explain a
+ * failure.
+ *
+ * The first version resolved with `{ code, stdout, stderr }` and every assertion
+ * passed `stderr` as its message. When the child died abnormally — exit code
+ * 3221226505, which is Windows' `0xC0000409`, a process that aborted rather than
+ * returned — stderr was empty, so the whole report was `3221226505 !== 0`. That
+ * is a test telling you it failed and refusing to say anything else, in a suite
+ * whose subject is not making claims it cannot support. `error` was not handled
+ * at all, so a spawn that never started would have hung instead of failing.
+ */
+function run(args: string[], cfg: string): Promise<Ran> {
   return new Promise((resolve) => {
-    const p = spawn(process.execPath, [CLI, ...args, '--config', configPath], { env });
+    const argv = [CLI, ...args, '--config', cfg];
+    const p = spawn(process.execPath, argv, { env });
     let stdout = '';
     let stderr = '';
+    let spawnError: string | null = null;
     p.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')));
     p.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')));
-    p.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+    p.on('error', (e: Error) => (spawnError = String(e)));
+    p.on('close', (code, signal) => {
+      const ran: Ran = {
+        code: code ?? -1,
+        stdout,
+        stderr,
+        signal,
+        spawnError,
+        report() {
+          const lines = [
+            `command: node ${argv.join(' ')}`,
+            `exit code: ${String(code)}${
+              code === 3221226505
+                ? ' (0xC0000409 — the process aborted rather than running and failing.\n' +
+                  '  Almost always this means dist/ was rewritten while the suite was running:\n' +
+                  '  the child loaded a half-written file. Measured: 0 failures in 25 runs with\n' +
+                  '  nothing else touching dist, 1 in 8 with a rebuild looping alongside. Check\n' +
+                  '  that no build, `npm pack`, or editor task is running, then run it again.)'
+                : ''
+            }`,
+            `signal: ${String(signal)}`,
+            `spawn error: ${String(spawnError)}`,
+            `stdout: ${stdout.trim() === '' ? '(empty)' : `\n${stdout.trim()}`}`,
+            `stderr: ${stderr.trim() === '' ? '(empty)' : `\n${stderr.trim()}`}`,
+          ];
+          return `\n${lines.join('\n')}\n`;
+        },
+      };
+      resolve(ran);
+    });
   });
 }
+
+const cli = (...args: string[]): Promise<Ran> => run(args, configPath);
 
 /** A tiny MCP client: one request in, one response out, over the real pipe. */
 class McpClient {
@@ -122,7 +182,7 @@ class McpClient {
 
 test('a plan proposed over MCP is approved and applied from the command line', async () => {
   const migrated = await cli('migrate');
-  assert.equal(migrated.code, 0, migrated.stderr);
+  assert.equal(migrated.code, 0, migrated.report());
 
   const mcp = new McpClient();
   try {
@@ -155,9 +215,9 @@ test('a plan proposed over MCP is approved and applied from the command line', a
     assert.equal(mid[0]?.status, 'pending');
 
     const approved = await cli('approve', id, '--as', 'tester', '--yes');
-    assert.equal(approved.code, 0, approved.stderr);
+    assert.equal(approved.code, 0, approved.report());
     const applied = await cli('apply', id, '--as', 'tester');
-    assert.equal(applied.code, 0, applied.stderr);
+    assert.equal(applied.code, 0, applied.report());
     assert.match(applied.stdout, /Applied: UPDATE on e2e_orders, 1 row/);
 
     const after = await db.query<{ status: string }>('SELECT status FROM e2e_orders WHERE id = 1');
@@ -178,21 +238,16 @@ test('a plan proposed over MCP is approved and applied from the command line', a
 test('the config file explains itself when it is wrong', async () => {
   const bad = join(dir, 'bad.json');
   await writeFile(bad, JSON.stringify({ dialect: 'postgres', connection: CONFIG.connection, policy: { allow: ['x'] } }), 'utf8');
-  const ran = await new Promise<Ran>((resolve) => {
-    const p = spawn(process.execPath, [CLI, 'check', '--config', bad], { env });
-    let stdout = '';
-    let stderr = '';
-    p.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')));
-    p.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')));
-    p.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
-  });
-  assert.equal(ran.code, 1);
-  assert.match(ran.stderr, /impact has no entry for x/);
+  // Through the same helper as every other spawn here. It used to have its own
+  // copy, which is how one of them ends up reporting a failure the other cannot.
+  const ran = await run(['check'], bad);
+  assert.equal(ran.code, 1, ran.report());
+  assert.match(ran.stderr, /impact has no entry for x/, ran.report());
 });
 
 test('check reports what it verified, per table', async () => {
   const ran = await cli('check');
-  assert.equal(ran.code, 0, ran.stderr);
+  assert.equal(ran.code, 0, ran.report());
   assert.match(ran.stdout, /a rollback really undoes a write/);
   assert.match(ran.stdout, /e2e_orders: ready/);
 });

@@ -4,6 +4,285 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-09
+
+### If you ran 0.1.0 – 0.3.1, check this in your own data
+
+Four of the fixes below could have let a change reach your database without
+appearing on the card somebody approved. None of them require anything unusual to
+have happened; they are all reachable from ordinary use. In rough order of how
+much it is worth looking:
+
+1. **Columns holding numeric-looking text** — postcodes, SKUs, account numbers,
+   anything zero-padded. If an `UPDATE` set such a column *and* something else,
+   the card showed only the something else and the apply wrote both. Compare the
+   approved plans in `llm_safe_sql_plans` against the rows they touched; a plan
+   whose `changed` list is shorter than the statement's `SET` clause is the shape
+   to look for.
+2. **PostgreSQL with a separate `applyConnection` role** — run
+   `SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON
+   n.oid = c.relnamespace WHERE c.relname IN (<your allowlisted tables>)`. More
+   than one row for a table name means unqualified names could resolve
+   differently per role, and writes may have landed in the schema you did not
+   mean. This needs a schema named after one of your roles to have existed.
+3. **Two `sql_plan` calls close together over MCP** — on MySQL the second could
+   commit the first one's trial. An audit record whose `phase` shows a plan that
+   was never applied, against a row that changed anyway, is the signature.
+4. **`denyWriteColumns`** — if you rely on it, search your audit trail for
+   `SET <table>.<column> =` and, on PostgreSQL, `SET (` . Both spellings were
+   accepted for a denied column.
+
+`check` in this version reports more than it used to, and is worth re-running
+against every environment before you trust the answer you got from an older one.
+
+### Fixed
+
+- **On PostgreSQL, the apply could commit to a different table from the one the
+  plan measured.** `search_path` was never set on any connection, and its default
+  is `"$user", public` — where `$user` expands per connection. This library
+  recommends giving the plan and the apply different database roles, which is
+  exactly what turns that default into two different answers to "which table is
+  `orders`".
+
+  Measured on PostgreSQL 16: with a schema named after the apply role holding a
+  table of the same name, the planner measured `public.sp_orders` and built a card
+  from it; the apply role ran the identical statement and wrote
+  `sp_applier.sp_orders`. The approved change did not happen, an unapproved one
+  did, and nothing reported an error. A role able to create a schema in its own
+  database can arrange this for itself.
+
+  Every Postgres connection now pins `search_path` to one schema — `public` by
+  default, `connection.schema` to change it — `selfCheck` proves it is still that
+  schema, and `check` prints a non-default schema as part of the connection's
+  identity. A deployment whose tables live elsewhere and forgets to say so now
+  gets "relation does not exist" instead of a quiet write to the wrong table.
+
+- **`denyWriteColumns` could be escaped by two ordinary spellings**, on the two
+  server engines, silently — the statement ran and the denied column was written:
+
+  - `SET orders.price = 1` — the extractor took the first identifier after `SET`,
+    so it reported the *table* as the column being assigned.
+  - `SET (qty, price) = (1, 2)` — PostgreSQL's multi-column form. The comma inside
+    the parentheses was not at depth 0 and was ignored, so only the first column
+    in the list was ever seen. Putting the denied column anywhere but first was
+    enough.
+
+  The SET clause is now parsed rather than approximated, and an assignment whose
+  target cannot be read refuses the statement instead of contributing nothing to
+  the check.
+
+- **A read with no `FROM` never met the allowlist.** Nothing in `SELECT 1` or
+  `SELECT nextval('order_id_seq')` names a table, so a default-deny policy had
+  nothing to compare and let it through. The second one is not hypothetical:
+  `nextval` advances a sequence for every session and a rollback does not put it
+  back, so the read path — the one an injected instruction reaches first — could
+  permanently consume ids. Reads must now name a table, and `nextval`, `setval`,
+  `pg_read_file`, `pg_ls_dir`, `lo_import`, `lo_export` and `dblink` join the
+  forbidden list.
+
+- **MySQL's `sql_mode` was neither pinned nor probed.** The lexer reads MySQL with
+  the server defaults, where `"x"` is a string literal. Under `ANSI_QUOTES` it is
+  an *identifier* — so `SELECT "api_token" FROM orders` is a column reference to
+  MySQL and a string to us, and `denyIdentifiers`, the rule that stops a
+  credential column being read, never fires. `NO_BACKSLASH_ESCAPES` moves where a
+  string literal ends, which is a disagreement about how many statements the text
+  contains. Both are now cleared per session — built from the current value, so
+  `STRICT_TRANS_TABLES` and the rest survive — and `selfCheck` refuses if anything
+  puts them back.
+
+- **The plan digest did not cover `impact` or `warnings`**, the two fields a
+  non-engineer actually reads: the sentence saying what changing this table means,
+  and the adapter limitations printed under "Before you approve". Editing either
+  in the stored plan changed what the next person was shown while the digest still
+  verified. Now covered; the digest is versioned `v2`, so plans stored by an older
+  version no longer verify — which is the correct direction to fail.
+
+- **A changed column could be dropped from the diff, so an unapproved write rode
+  along under an approved one.** `sameValue` applied its numeric tolerance
+  between two *strings*, not only across types as its own comment described. Both
+  sides of a diff come from the same driver and the same column, so two strings
+  are two spellings the database is storing verbatim — and `'00100'` and `'100'`
+  are different postcodes, different SKUs, different account numbers.
+
+  Measured end to end before the fix: `UPDATE customers SET name = 'Grace',
+  postcode = '100'` against a row holding `('Ada', '00100')` produced a card
+  reading *"1 row would change, across 1 column: name"*, listing only the name.
+  The column was absent from `changed`, therefore from the card, from the plan
+  digest, and from the pre-apply comparison — so nothing downstream could catch
+  it either. The apply committed both.
+
+  This is the same defect as the microsecond ride-along fixed in 0.1.1, in a
+  different type: a real change made invisible by a comparison that was too
+  tolerant. The tolerance is now restricted to the disagreement it was written
+  for — a driver returning DECIMAL or BIGINT as `10` in one place and `"10.00"`
+  in another — and every one of those cases still works.
+
+- **Two overlapping dry runs could commit one another, on MySQL, permanently.**
+  The anti-nesting check asks the adapter whether a transaction is already open,
+  and it sits several `await`s before the `begin()` it guards — so two calls that
+  overlap both saw "no transaction" and both opened one. Measured on MySQL 8.4:
+  `START TRANSACTION` on a connection that already has one open **commits** it.
+  The first trial's `UPDATE` therefore became a permanent write to production and
+  was then reported to the operator as rolled back.
+
+  This needed no concurrency in the caller. The MCP server serves tool calls as
+  they arrive, on one shared session, so two `sql_plan` calls close together were
+  enough. It is the exact outcome this library exists to make impossible, and it
+  was reachable through the shipped configuration.
+
+  `Engine.plan` now takes a latch before its first `await` — the only kind of
+  lock a single-threaded runtime has — and refuses with `BUSY` rather than
+  queueing, because a caller told "later" can decide what to do and a caller held
+  behind a lock of unknown duration cannot. `Engine.read` refuses the same way
+  when it shares the planning connection, since a read served from inside an open
+  trial returns the values we are only pretending about. With `readConnection`
+  configured there is nothing to collide with, and the read proceeds.
+
+- **`SqliteAdapter.selfCheck` ignored its `mode` parameter** — the same defect as
+  the two above, in the third adapter, where the parameter was even spelled
+  `_mode`. A read-only handle asked for the write path's check returned success
+  having proven no rollback and no counting model, after which `check` printed "a
+  rollback really undoes a write" about it; and a writable handle used as
+  `readConnection` was put through the full write probe on every read, taking
+  `BEGIN IMMEDIATE` — a whole-database write lock — so reads failed with
+  "database is locked" whenever anything else was writing.
+
+- **The MySQL adapter declared no limitations, and MySQL has one.**
+  `max_execution_time` applies to read-only `SELECT`; MySQL has no statement
+  timeout for an `UPDATE` or `DELETE` at all. This repository has measured that
+  and pinned it in a test since 0.1.0, while the adapter's `limitations` array
+  stayed empty and its comment said there was "nothing to disclaim". So
+  `limits.statementMs` appeared enforced, no confirmation card mentioned it, and
+  `check` said nothing — the precise failure SPEC E5 exists to prevent, on the
+  engine where SQLite's identical gap is declared in full.
+
+- **`check` printed "every role is a distinct credential" without comparing the
+  store credential against the plan credential.** It compared store against apply
+  only, so a configuration whose store and plan are the same account — the
+  default, whenever `applyConnection` alone is separated — passed silently. The
+  side that proposes a change could also edit the stored plan it is later checked
+  against.
+
+- **`check` reported an ordinary read-write account as unable to write** — and
+  reports that by printing nothing, which reads as approval. `probeWritable`
+  created a temporary table and called success "writable", but that is a
+  different privilege: on MySQL `CREATE TEMPORARY TABLES` is granted separately
+  from DML, so the account produced by `GRANT SELECT, INSERT, UPDATE, DELETE`
+  failed the probe. Measured on MySQL 8.4 and PostgreSQL 16 — the probe said
+  "cannot write" about a connection that was updating a row at the time.
+
+  This is the worst output this library can produce. Everything else it gets
+  wrong makes it refuse to act; this one tells an operator that a boundary exists
+  below the code when there is none, in the command they run specifically to find
+  out where the boundaries are.
+
+  `probeWritable(tables)` now attempts the writes this library can actually emit
+  — `DELETE ... WHERE 1 = 0`, then `UPDATE ... SET c = c WHERE 1 = 0` per column —
+  inside a transaction that is always rolled back. Both engines check the
+  privilege while preparing the statement, before a row is matched, so the probe
+  is answered without touching data. On PostgreSQL each attempt takes its own
+  savepoint: Postgres aborts the whole transaction on the first error, and every
+  statement after it fails with `current transaction is aborted`, which a `catch`
+  cannot tell from a refusal. Without the savepoints a role holding UPDATE but
+  not DELETE probes as read-only — the same false negative, reintroduced.
+
+- **The 0.3.1 fix was applied to PostgreSQL and SQLite and omitted for MySQL**,
+  in the same commit, so `readConnection` still refused a least-privilege MySQL
+  user with "Cannot create a TEMPORARY table". TypeScript does not catch this:
+  a `selfCheck()` that ignores the parameter still satisfies
+  `selfCheck(mode?: SelfCheckMode)`, so the gap compiles silently. (The new
+  `probeWritable` takes a required argument partly for this reason: a signature
+  an adapter cannot satisfy by ignoring it fails the build instead of a user.)
+
+- **`SQLite` resolved table and trigger names case-sensitively**, while SQLite
+  itself does not. A table created as `Orders` and allowlisted as `orders` was
+  reported as not found, and — worse — a trigger declared `ON orders` against a
+  table created as `Orders` was not counted, so `autoColumnsKnown` came back
+  `true` and the engine reported "no column moves by itself" about a table with a
+  trigger writing to it.
+
+- **`AdapterUnusable` was not a `Refusal`.** SPEC's appendix says every deliberate
+  "no" in this library is a `Refusal` carrying a `code`, and this class is the
+  source of most of the conditions reported as `ADAPTER_UNUSABLE` — so a caller
+  following the documentation and catching `Refusal` caught every refusal except
+  "the environment cannot support the guarantees", which escaped as an unhandled
+  rejection.
+
+- **`llm-safe-sql check` never verified the store connection**, though it lists
+  `store` as a role and then prints "Connections are usable". That is the
+  connection the record of an approval lives on.
+
+- **`llm-safe-sql apply` exited 1 for a successful apply that produced a
+  warning**, telling every script and CI step that the write had failed when it
+  had succeeded — and the obvious response to a failed apply is to run it again.
+  A warning is something to read, not a different outcome.
+
+- **A relative SQLite `file` was resolved against the process's working
+  directory**, so the CLI run from one directory and the MCP server started from
+  another pointed at two different files — and SQLite creates a missing one rather
+  than complaining, so the second was an empty database answering questions about
+  the first. Paths are now resolved against the config file that names them.
+
+### Added
+
+- **SPEC P7 is implemented**: a `SET` column that does not exist is refused before
+  anything runs, naming the columns the table does have. The rule had been in SPEC
+  since the first version with nothing behind it, so a misspelling was found by
+  the database — after the trial had already executed — and surfaced as a raw
+  driver error.
+- **SPEC E10**: a probe must attempt the operation it reports on, and must be able
+  to answer "not established" rather than collapsing that into the reassuring
+  answer. Earned from the `probeWritable` defect below.
+- **`connection.schema`** for PostgreSQL.
+- **SPEC D12 is withdrawn.** It specified how to compare "masked columns", a
+  feature this library deliberately does not have — masking a result set by column
+  name is defeated by `SELECT secret AS x`, which is why `denyIdentifiers` refuses
+  the reference instead. A rule describing behaviour no code has is the same
+  defect as a limit that is documented and unenforced. E6 and E7 are likewise
+  rewritten to say what is actually established, per engine, rather than to state
+  one universal claim that one adapter of three honoured.
+
+### Changed
+
+- **`Adapter.probeWritable()` is now `probeWritable(tables)` and returns
+  `'writable' | 'read-only' | 'unknown'`** rather than a boolean. A custom
+  adapter must be updated. The third state is the point: "could not establish"
+  and "proved it cannot write" are different answers, and collapsing them into
+  `false` is what let a probe that measured nothing print a clean bill of health.
+  `check` now prints all three distinctly, and only says a read connection is
+  constrained when it proved it on the caller's own tables.
+
+### Testing
+
+- The reason the `readConnection` bug reached a release twice is that nothing
+  tested the read path against a real restricted credential on either server
+  engine. `test/integration/readonly.test.ts` now builds **three** accounts per
+  engine and pins fourteen behaviours across MySQL and PostgreSQL.
+
+  The third account is the one that matters: `rw_probe` holds full DML and cannot
+  create a temporary table. The first version of this file had only an
+  all-privileges account and a SELECT-only one, and *both* of them agreed with a
+  `probeWritable` that was measuring the wrong thing — a suite can be green,
+  per-engine, and still be asking the wrong question of every credential it has.
+
+- **The intermittent end-to-end failure was not a flaky test.** It was `dist/`
+  being rewritten while the suite ran — a child process loading a half-written
+  file aborts, on Windows with exit code `3221226505` and an empty stderr, which
+  looks exactly like flakiness. Measured on the same three files: 0 failures in 25
+  runs with nothing else touching `dist`, 1 in 8 with a build looping alongside.
+  The spawn helper now keeps stdout, stderr, the signal and the spawn error and
+  prints all of them, and names this cause when it sees that exit code; the runner
+  says not to rebuild during a run. The helper also no longer passes
+  `NODE_TEST_CONTEXT` to the programs it starts — a process that inherits it
+  believes it is a test worker, and one of the two started here is an MCP server
+  whose protocol is stdout.
+
+- The file no longer revokes `TEMPORARY` on the shared test database. That is a
+  property of a whole database, so every other connection saw it at once, and a
+  process killed between the revoke and the restore left every later run failing
+  with an error that points at the library rather than at the test. It now
+  creates and drops a database of its own.
+
 ## [0.3.1] — 2026-08-09
 
 ### Fixed
@@ -21,10 +300,17 @@ All notable changes to this project are documented here. The format follows
   credentials as `connection` still produced a second object. A session now opens
   a separate read connection only when the credential actually differs.
 - `check` no longer takes "you configured a different role" as evidence of
-  anything. It calls the new `Adapter.probeWritable()` — an attempted write,
-  rolled back — and says so when a `readConnection` is a distinct credential that
-  can still write. Configuring a different role and configuring a role that
-  cannot write are separate facts, and only the second one is a boundary.
+  anything. It calls the new `Adapter.probeWritable()` and says so when a
+  `readConnection` is a distinct credential that can still write. Configuring a
+  different role and configuring a role that cannot write are separate facts, and
+  only the second one is a boundary.
+
+  **Correction (0.4.0).** This entry originally described that probe as "an
+  attempted write, rolled back". It was not: it created a temporary table, which
+  is a different privilege, and so reported an ordinary read-write account as
+  unable to write. The sentence is corrected here rather than deleted, because a
+  changelog that quietly stops having said something is no better a record than
+  the probe was. Fixed in 0.4.0.
 
 ## [0.3.0] — 2026-08-09
 
@@ -228,6 +514,7 @@ produced a plan describing something other than what would happen:
 - No runtime dependencies. Drivers are optional peers; the MCP server implements
   the wire protocol directly.
 
+[0.4.0]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.4.0
 [0.3.1]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.3.1
 [0.3.0]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.3.0
 [0.2.0]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.2.0

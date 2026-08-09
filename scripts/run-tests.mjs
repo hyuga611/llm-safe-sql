@@ -41,5 +41,20 @@ if (files.length === 0) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' });
+// Integration files share ONE database, so running them concurrently means one
+// file's DDL, GRANT or REVOKE lands in the middle of another's transaction. That
+// has bitten this suite twice: once as a plan-table collision, once as a test
+// that passed alone and failed in the full run. A flaky suite is worse than a
+// slow one — it trains you to re-run instead of to look — so anything sharing a
+// database runs one file at a time.
+//
+// One more thing to know, because it costs an afternoon otherwise: do not rebuild
+// while this is running. `tsc` rewrites the same files the runner is loading and
+// the end-to-end test is spawning, and a child that loads a half-written file
+// aborts — on Windows with exit code 3221226505 and an empty stderr, which looks
+// exactly like a flaky test and is not one. Measured on this suite: 0 failures in
+// 25 runs with nothing else touching dist, 1 in 8 with a build looping alongside.
+const serial = process.argv.includes('--serial');
+const args = serial ? ['--test', '--test-concurrency=1', ...files] : ['--test', ...files];
+const result = spawnSync(process.execPath, args, { stdio: 'inherit' });
 process.exit(result.status ?? 1);

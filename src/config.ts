@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import type { Adapter } from './adapter.js';
 import type { Dialect } from './lexer.js';
 import { Policy, type PolicyOptions } from './policy.js';
@@ -29,6 +30,16 @@ export interface ServerConnectionConfig {
   readonly user: string;
   readonly password: string;
   readonly database: string;
+  /**
+   * PostgreSQL only: the schema unqualified table names resolve against.
+   * Defaults to `public`, and is pinned on the connection rather than inherited.
+   *
+   * PostgreSQL's own default is `"$user", public`, which resolves differently for
+   * every role — so with the plan and the apply on different roles, as this
+   * library recommends, the same statement can measure one table and write
+   * another. Set this when your tables do not live in `public`.
+   */
+  readonly schema?: string;
 }
 
 /**
@@ -66,7 +77,11 @@ export function isSqliteConnection(c: ConnectionConfig): c is SqliteConnectionCo
  */
 export function connectionIdentity(c: ConnectionConfig): string {
   if (isSqliteConnection(c)) return `file:${c.file}${c.readOnly === true ? ' (read-only)' : ''}`;
-  return `${c.user}@${c.host}:${String(c.port)}/${c.database}`;
+  // The schema is part of the identity, not decoration: two connections that
+  // differ only by it resolve every unqualified table name to different tables,
+  // and `check` exists to show exactly that kind of difference.
+  const schema = c.schema === undefined || c.schema === 'public' ? '' : ` schema=${c.schema}`;
+  return `${c.user}@${c.host}:${String(c.port)}/${c.database}${schema}`;
 }
 
 export interface LimitsConfig {
@@ -251,7 +266,30 @@ export async function loadConfig(path: string, env: NodeJS.ProcessEnv = process.
   } catch (e) {
     throw new ConfigError(`${path} is not valid JSON: ${String(e)}`);
   }
-  return parseConfig(raw, env);
+  return resolveFiles(parseConfig(raw, env), dirname(resolve(path)));
+}
+
+/**
+ * Make every SQLite path mean the same database wherever the command is run from.
+ *
+ * A relative `"file"` used to be resolved against the process's working
+ * directory, so `llm-safe-sql apply` from one directory and the MCP server
+ * started from another pointed at two different files — and SQLite creates a
+ * missing one rather than complaining, so the second was an empty database that
+ * answered every question about the first perfectly quietly. Relative to the
+ * config file is the only reading under which the same config always names the
+ * same database.
+ */
+function resolveFiles(cfg: Config, base: string): Config {
+  const fix = <T extends ConnectionConfig | undefined>(c: T): T =>
+    c !== undefined && isSqliteConnection(c) && !isAbsolute(c.file) ? ({ ...c, file: resolve(base, c.file) } as T) : c;
+  return {
+    ...cfg,
+    connection: fix(cfg.connection),
+    ...(cfg.readConnection === undefined ? {} : { readConnection: fix(cfg.readConnection) }),
+    ...(cfg.applyConnection === undefined ? {} : { applyConnection: fix(cfg.applyConnection) }),
+    ...(cfg.storeConnection === undefined ? {} : { storeConnection: fix(cfg.storeConnection) }),
+  };
 }
 
 export function policyOf(cfg: Config): Policy {

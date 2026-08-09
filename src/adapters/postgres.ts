@@ -1,6 +1,6 @@
 import pg from 'pg';
-import type { Adapter, ColumnShape, Row, Savepoint, SelfCheckMode, TableShape } from '../adapter.js';
-import { AdapterUnusable } from '../adapter.js';
+import type { Adapter, ColumnShape, Row, Savepoint, SelfCheckMode, TableShape, WriteAbility } from '../adapter.js';
+import { AdapterUnusable, probeWriteAbility } from '../adapter.js';
 
 export { AdapterUnusable };
 
@@ -10,6 +10,13 @@ export interface PostgresConfig {
   user: string;
   password: string;
   database: string;
+  /**
+   * The schema unqualified table names resolve against. Defaults to `public`.
+   *
+   * Set on every connection this adapter opens. See {@link PostgresAdapter.connect}
+   * for why leaving PostgreSQL's default in place is not an option here.
+   */
+  schema?: string;
 }
 
 /**
@@ -46,14 +53,45 @@ export class PostgresAdapter implements Adapter {
   private open = false;
   private savepoints = 0;
 
-  private constructor(client: pg.Client) {
+  private constructor(client: pg.Client, schema: string) {
     this.client = client;
+    this.schema = schema;
   }
 
+  /**
+   * The schema every unqualified table name in this session resolves against.
+   *
+   * Kept so `check` can print it and so {@link selfCheck} can prove it took, and
+   * because the alternative is what this library shipped until 0.4.0: nothing.
+   */
+  readonly schema: string;
+
   static async connect(cfg: PostgresConfig): Promise<PostgresAdapter> {
-    const client = new pg.Client({ ...cfg, types: TYPES as never });
+    const { schema = 'public', ...rest } = cfg;
+    const client = new pg.Client({ ...rest, types: TYPES as never });
     await client.connect();
-    return new PostgresAdapter(client);
+    const self = new PostgresAdapter(client, schema);
+
+    // Pin the search path. PostgreSQL's default is `"$user", public`, and `$user`
+    // expands per connection — so `orders` is a *different table* depending on
+    // which role asked. This library's recommended deployment gives the plan and
+    // the apply different roles, which makes that difference the gap between what
+    // was measured and what gets written.
+    //
+    // Measured on PostgreSQL 16, before this line existed: with a schema named
+    // after the apply role holding a table of the same name, the planner measured
+    // `public.sp_orders` and produced a card from it; the apply role then ran the
+    // identical statement and wrote `sp_applier.sp_orders`. The approved change
+    // did not happen and an unapproved one did, with no error anywhere. A role
+    // that can create a schema in its own database can arrange this for itself,
+    // which is the ordinary shape of a search-path attack.
+    //
+    // `pg_catalog` is searched implicitly whatever this says, so introspection
+    // still works; a deployment whose tables live elsewhere sets `schema` and
+    // gets a loud "relation does not exist" if it gets that wrong, rather than a
+    // quiet write to the wrong table.
+    await client.query(`SET search_path TO ${self.quoteIdent(schema)}`);
+    return self;
   }
 
   async selfCheck(mode: SelfCheckMode = 'full'): Promise<void> {
@@ -66,6 +104,21 @@ export class PostgresAdapter implements Adapter {
       throw new AdapterUnusable(
         'Session state does not survive between statements. A connection pooler in transaction mode ' +
           'cannot be used: a dry run could be left open on a connection handed to another caller.',
+      );
+    }
+
+    // 1b. The search path is still the one we pinned. Checked on the read path
+    //     too, because a read answered from a different schema is a wrong answer
+    //     in exactly the way a write to a different schema is a wrong write — and
+    //     because whatever could reset it between statements (a pooler, a
+    //     `ALTER ROLE ... SET search_path` applied at reconnect) would do so
+    //     silently.
+    const path = await this.client.query<{ v: string }>('SELECT current_schema() AS v');
+    if (path.rows[0]?.v !== this.schema) {
+      throw new AdapterUnusable(
+        `This session resolves unqualified names against "${String(path.rows[0]?.v)}", not the configured ` +
+          `"${this.schema}". Every unqualified table in a statement would mean a different table from the ` +
+          'one that was measured, so nothing here can be relied on.',
       );
     }
 
@@ -269,18 +322,39 @@ export class PostgresAdapter implements Adapter {
   }
 
   /**
-   * Attempt a write inside a transaction that is always rolled back.
+   * Ask PostgreSQL whether this role may change the allowlisted tables.
    *
-   * A temporary table rather than a real one: a role that can write to the
-   * schema but not create tables would otherwise read as read-only.
+   * Every attempt gets its own savepoint, and that is not tidiness. Postgres puts
+   * the whole transaction into an aborted state as soon as one statement fails,
+   * and every statement after that returns `current transaction is aborted`. That
+   * error is indistinguishable, to a `catch`, from a refusal — so without the
+   * savepoints a role holding UPDATE but not DELETE probes as read-only, which is
+   * the one answer that must never be wrong. Measured on PostgreSQL 16.
    */
-  async probeWritable(): Promise<boolean> {
+  async probeWritable(tables: readonly string[]): Promise<WriteAbility> {
+    // Never inside a caller's transaction: the rollback below would discard
+    // their work. Nothing was established, so say exactly that.
+    if (this.inTransaction()) return 'unknown';
+    await this.client.query('BEGIN');
+    let n = 0;
     try {
-      await this.client.query('BEGIN');
-      await this.client.query('CREATE TEMP TABLE llm_safe_sql_wprobe (id INT)');
-      return true;
-    } catch {
-      return false;
+      return await probeWriteAbility(
+        tables,
+        async (t) => (await this.introspect(t)).columns.map((c) => c.name),
+        (name) => this.quoteIdent(name),
+        async (sql) => {
+          const sp = `llm_safe_sql_wprobe_${++n}`;
+          await this.client.query(`SAVEPOINT ${sp}`);
+          try {
+            await this.client.query(sql);
+            await this.client.query(`RELEASE SAVEPOINT ${sp}`);
+            return true;
+          } catch {
+            await this.client.query(`ROLLBACK TO SAVEPOINT ${sp}`).catch(() => {});
+            return false;
+          }
+        },
+      );
     } finally {
       await this.client.query('ROLLBACK').catch(() => {});
     }

@@ -16,10 +16,24 @@ import type { Plan } from './engine.js';
  * not a security boundary — anyone who can write the plan table can recompute it.
  * The boundary is that the plan table is refused to callers of this library
  * (P5), and that applying needs a credential the model does not have.
+ *
+ * "Exactly what a human approved" has to mean the whole card, and until 0.4.0 it
+ * did not. `impact` and `warnings` were left out, and those are the two fields a
+ * non-engineer actually reads: `impact` is the sentence the policy calls "the
+ * rule that keeps human approval real" — *changing the ship date moves which
+ * month this supplier gets paid in* — and `warnings` is where an adapter's
+ * unenforceable limits are surfaced. Editing either in the stored row changed
+ * what the next person was shown while the digest still verified. A tamper check
+ * that covers the numbers and not the sentence explaining them protects the part
+ * nobody was going to be misled by.
  */
 export function planDigest(plan: Plan): string {
   const parts: string[] = [
-    'llm-safe-sql/plan/v1',
+    // Bumped from v1 when impact and warnings were added. Plans stored by an
+    // older version no longer verify, which is the correct direction to fail: a
+    // plan whose covered surface is smaller than this version believes is a plan
+    // this version cannot vouch for.
+    'llm-safe-sql/plan/v2',
     plan.dialect,
     plan.op,
     plan.table,
@@ -27,6 +41,10 @@ export function planDigest(plan: Plan): string {
     String(plan.rowsMatched),
     String(plan.rowsChanged),
     String(plan.rowsChangedIsMeaningful),
+    plan.impact,
+    // Order is meaningful here — it is the order they are printed in.
+    String(plan.warnings.length),
+    ...plan.warnings,
   ];
 
   for (const r of plan.rows) {

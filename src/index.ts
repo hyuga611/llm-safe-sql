@@ -78,7 +78,15 @@ export type { ReadSession, AdminSession } from './session.js';
 export { planCard, planBody } from './card.js';
 export { VERSION } from './version.js';
 
+// The whole `Adapter` surface, not just the interface name. Exporting `Adapter`
+// while keeping `SelfCheckMode` and `WriteAbility` internal left it unimplementable
+// from outside the package: there was no way to name the parameter or the return
+// type, and no export path to deep-import them from. `AdapterUnusable` belongs
+// here too — it deliberately lives in the module with no driver imports, so the
+// root can carry it without dragging mysql2 into a Postgres-only install.
 export type { Adapter, TableShape, ColumnShape, InboundCascade, Row, Savepoint } from './adapter.js';
+export type { SelfCheckMode, WriteAbility } from './adapter.js';
+export { AdapterUnusable, probeWriteAbility } from './adapter.js';
 
 export { planDigest } from './digest.js';
 export { encodePlan, decodePlan } from './serialize.js';

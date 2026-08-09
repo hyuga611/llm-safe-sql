@@ -90,3 +90,32 @@ test('canonical is stable, so it can key a row snapshot', () => {
   assert.notEqual(canonical(10), canonical('10'));
   assert.equal(sameValue(10, '10'), true);
 });
+
+// ---------------------------------------------------------------------
+//  Two strings are two spellings the database is storing verbatim.
+// ---------------------------------------------------------------------
+
+test('a zero-padded string is not the same value as its unpadded form', () => {
+  // This returned true, and the consequence was not a cosmetic one. The column
+  // was dropped from `changed`, so it appeared on no card, entered no digest and
+  // was compared by no guard at apply — an UPDATE setting a name and a postcode
+  // was approved as "1 column: name" and committed both.
+  assert.equal(sameValue('00100', '100'), false);
+  assert.equal(sameValue('007', '7'), false);
+  assert.equal(sameValue('00', '0'), false);
+  assert.equal(sameValue('+5', '5'), false);
+  assert.equal(sameValue(' 42', '42'), false, 'whitespace is part of a stored string');
+  assert.equal(sameValue('0', '0.0'), false);
+});
+
+test('the numeric tolerance survives where it was actually needed: across types', () => {
+  // Drivers disagree about whether DECIMAL and BIGINT arrive as a number or as
+  // text. That is the disagreement this tolerance exists for, and narrowing it to
+  // cross-type comparisons leaves every one of those cases working.
+  assert.equal(sameValue('10.00', 10), true);
+  assert.equal(sameValue(10, '10.00'), true);
+  assert.equal(sameValue('0010', 10), true);
+  assert.equal(sameValue(10n, 10), true);
+  assert.equal(sameValue('9007199254740993', 9007199254740993n), true);
+  assert.equal(sameValue(0, 'abc'), false, 'a non-numeric string is never a number');
+});

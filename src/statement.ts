@@ -98,38 +98,142 @@ export function tableRefs(tokens: readonly Token[]): string[] {
   return out;
 }
 
-/** Column names on the left of each assignment in an UPDATE ... SET clause. */
+/**
+ * Column names on the left of each assignment in an UPDATE ... SET clause.
+ *
+ * This feeds `denyWriteColumns`, so a column it fails to report is a column that
+ * guard does not protect. Two spellings used to escape it, and both were silent —
+ * the statement ran, the denied column was written, and nothing refused:
+ *
+ *   `SET orders.price = 1`      — it took the first identifier after `SET`, so it
+ *                                 reported the *table* as the column name. Legal
+ *                                 SQL on MySQL and Postgres alike.
+ *   `SET (qty, price) = (1, 2)` — Postgres' multi-column form. The comma inside
+ *                                 the parentheses was ignored because it was not
+ *                                 at depth 0, so only the first column was seen.
+ *                                 Putting the denied column anywhere but first
+ *                                 was enough.
+ *
+ * So the shape is parsed properly rather than approximated: a qualified name
+ * reduces to its last component, and the parenthesised column list is read as a
+ * list. When the left side cannot be understood at all, the name is reported as
+ * `undefined` — see {@link setColumnsAreCertain} — because a guard that cannot
+ * read a statement must not report that the statement is clean.
+ */
 export function setColumns(tokens: readonly Token[]): string[] {
-  const toks = significant(tokens);
-  const out: string[] = [];
-  let depth = 0;
-  let inSet = false;
-  let atColumn = false;
+  return setTargets(tokens).filter((c): c is string => c !== undefined);
+}
 
-  for (const t of toks) {
+/**
+ * False when the SET clause contained an assignment whose target could not be
+ * identified. The policy treats that as a refusal rather than as an absence.
+ */
+export function setColumnsAreCertain(tokens: readonly Token[]): boolean {
+  return !setTargets(tokens).includes(undefined);
+}
+
+function setTargets(tokens: readonly Token[]): (string | undefined)[] {
+  const toks = significant(tokens);
+  const out: (string | undefined)[] = [];
+  let depth = 0;
+  let i = 0;
+
+  // Find the top-level SET.
+  for (; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === undefined) continue;
     if (t.kind === 'punct') {
       if (t.value === '(') depth++;
       else if (t.value === ')') depth--;
-      else if (t.value === ',' && inSet && depth === 0) atColumn = true;
       continue;
     }
-    if (t.kind === 'ident' && lower(t.value) === 'set' && !inSet) {
-      inSet = true;
-      atColumn = true;
+    if (depth === 0 && t.kind === 'ident' && lower(t.value) === 'set') {
+      i++;
+      break;
+    }
+  }
+  if (i >= toks.length) return out;
+
+  const isName = (t: Token | undefined): boolean => t?.kind === 'ident' || t?.kind === 'quotedIdent';
+
+  /** `db.tbl.col` is a name for `col`. Consumes the whole dotted run. */
+  const qualified = (): string | undefined => {
+    if (!isName(toks[i])) return undefined;
+    let last = toks[i]?.value;
+    i++;
+    while (toks[i]?.kind === 'punct' && toks[i]?.value === '.') {
+      i++;
+      if (!isName(toks[i])) return undefined; // `t.` with nothing after it
+      last = toks[i]?.value;
+      i++;
+    }
+    return last;
+  };
+
+  /** Skip the assigned expression, stopping at the comma that starts the next one. */
+  const skipValue = (): void => {
+    let d = 0;
+    for (; i < toks.length; i++) {
+      const t = toks[i];
+      if (t === undefined) continue;
+      if (t.kind === 'punct') {
+        if (t.value === '(') d++;
+        else if (t.value === ')') d--;
+        else if (t.value === ',' && d === 0) {
+          i++;
+          return;
+        }
+        continue;
+      }
+      // FROM belongs to Postgres' UPDATE ... FROM, which normalize refuses
+      // separately; either way the SET clause has ended.
+      if (d === 0 && t.kind === 'ident' && SET_END.has(lower(t.value))) {
+        i = toks.length;
+        return;
+      }
+    }
+  };
+
+  while (i < toks.length) {
+    const t = toks[i];
+    if (t === undefined) break;
+    if (t.kind === 'ident' && SET_END.has(lower(t.value))) break;
+
+    if (t.kind === 'punct' && t.value === '(') {
+      // Postgres' `SET (a, b, c) = (...)`: every name in the list is a target.
+      i++;
+      for (;;) {
+        const name = qualified();
+        out.push(name);
+        const next = toks[i];
+        if (next?.kind === 'punct' && next.value === ',') {
+          i++;
+          continue;
+        }
+        if (next?.kind === 'punct' && next.value === ')') i++;
+        break;
+      }
+      skipValue();
       continue;
     }
-    if (t.kind === 'ident' && lower(t.value) === 'where' && depth === 0) {
-      inSet = false;
+
+    if (isName(t)) {
+      out.push(qualified());
+      skipValue();
       continue;
     }
-    if (inSet && atColumn && (t.kind === 'ident' || t.kind === 'quotedIdent')) {
-      out.push(t.value); // author's spelling; callers fold case to compare
-      atColumn = false;
-    }
+
+    // Something unexpected on the left of an assignment. Record that a target
+    // exists and could not be read, rather than moving on quietly.
+    out.push(undefined);
+    skipValue();
   }
 
   return out;
 }
+
+/** Words that end the SET clause of an UPDATE. */
+const SET_END: ReadonlySet<string> = new Set(['where', 'from', 'returning', 'order', 'limit']);
 
 /**
  * The text of the top-level WHERE clause, or undefined when there is none.

@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { MysqlAdapter } from '../../src/adapters/mysql.js';
 import { PostgresAdapter } from '../../src/adapters/postgres.js';
 import type { Adapter } from '../../src/adapter.js';
+import { AdapterUnusable } from '../../src/adapter.js';
 
 const MYSQL = { host: '127.0.0.1', port: 13306, user: 'root', password: 'llmsafesql', database: 'llmsafesql' };
 const PG = { host: '127.0.0.1', port: 15432, user: 'postgres', password: 'llmsafesql', database: 'llmsafesql' };
@@ -192,4 +193,38 @@ test('Postgres: the ordinary updated_at trigger makes auto columns unknowable', 
   // concurrent modification. Detected honestly rather than guessed.
   const shape = await pgA.introspect('ad_trig');
   assert.equal(shape.autoColumnsKnown, false);
+});
+
+test('MySQL: the session agrees with the parser about what the text means', async () => {
+  // The lexer reads MySQL with the server defaults: `"x"` is a string, and a
+  // backslash escapes inside one. `ANSI_QUOTES` makes `"api_token"` an
+  // *identifier* instead, so `denyIdentifiers` — the rule that stops a credential
+  // column being read — never fires while MySQL happily returns the column.
+  // `NO_BACKSLASH_ESCAPES` moves where a string literal ends, which is a
+  // disagreement about how many statements the text contains.
+  //
+  // The adapter clears both when it opens the connection. Verified separately,
+  // by hand, against a server whose GLOBAL sql_mode was set to ANSI_QUOTES: the
+  // new session came back without it and kept STRICT_TRANS_TABLES. That is not
+  // done here, because setting a GLOBAL leaves the server changed for every
+  // later run if this process is killed between the set and the restore.
+  const [row] = await my.query<{ m: string }>('SELECT @@SESSION.sql_mode AS m');
+  const modes = String(row?.m ?? '').split(',');
+  for (const bad of ['ANSI_QUOTES', 'NO_BACKSLASH_ESCAPES', 'ANSI']) {
+    assert.ok(!modes.includes(bad), `${bad} must not be active on a connection this library opened`);
+  }
+});
+
+test('MySQL: a sql_mode changed underneath us is refused, not worked around', async () => {
+  const probe = await MysqlAdapter.connect(MYSQL);
+  try {
+    await probe.selfCheck('read'); // clean to start with
+    await probe.query("SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',ANSI_QUOTES')");
+    await assert.rejects(
+      () => probe.selfCheck('read'),
+      (e: unknown) => e instanceof AdapterUnusable && /ANSI_QUOTES/.test((e as Error).message),
+    );
+  } finally {
+    await probe.close();
+  }
 });

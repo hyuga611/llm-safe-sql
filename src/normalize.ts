@@ -177,7 +177,14 @@ export function normalize(input: string, opts: NormalizeOptions): NormalizeResul
   }
 
   for (const [word, why] of FORBIDDEN) {
-    if (bare.has(word)) {
+    // `all`, not `bare`. The list was matched against unquoted identifiers only,
+    // on the reasoning that a quoted name is a user's own column — but the same
+    // quoting makes `"nextval"`, `"pg_read_file"` and `"information_schema"`
+    // reach the server as exactly the thing being forbidden. A denied name
+    // deserves to be denied however it is spelled; the false positive it costs is
+    // a table genuinely called `lock` or `execute`, which is a refusal with a
+    // clear message, not a silent bypass.
+    if (all.has(word)) {
       throw new Rejected('FORBIDDEN', `\`${word.toUpperCase()}\` is not accepted here (${why}).`);
     }
   }

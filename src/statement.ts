@@ -53,8 +53,17 @@ export function tableRefs(tokens: readonly Token[]): string[] {
     if (t === undefined) continue;
 
     if (t.kind === 'punct') {
-      if (t.value === '(') depth++;
-      else if (t.value === ')') depth--;
+      if (t.value === '(') {
+        depth++;
+        // A parenthesis where a table name was expected is a derived table:
+        // `FROM (SELECT ...) AS x`. Leaving `expect` set meant the next
+        // identifier — the keyword SELECT — was recorded as the table, so every
+        // read with a subquery in its FROM was refused with "Table `SELECT` is
+        // not in the allowlist". The tables inside are still found: this scan
+        // does not stop at the parenthesis, and their own FROM sets `expect`
+        // again.
+        expect = false;
+      } else if (t.value === ')') depth--;
       else if (t.value === ',' && inFrom && depth === fromDepth) expect = true;
       continue;
     }
@@ -95,7 +104,45 @@ export function tableRefs(tokens: readonly Token[]): string[] {
     }
   }
 
-  return out;
+  // Common table expressions are names this statement defines, not tables it
+  // reads. Reporting them made `WITH x AS (...) SELECT * FROM x` refuse `x` as
+  // not allowlisted — so SPEC's "SELECT and WITH" could not hold for any usable
+  // WITH. Dropping them is safe because a CTE's own body is scanned by the same
+  // loop, so `WITH orders AS (SELECT * FROM secrets) SELECT * FROM orders` still
+  // reports `secrets`.
+  const defined = cteNames(toks);
+  return out.filter((n) => !defined.has(lower(n)));
+}
+
+/** Names introduced by `WITH name AS (…)`, including the `, name AS (…)` chain. */
+function cteNames(toks: readonly Token[]): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (let i = 0; i + 2 < toks.length; i++) {
+    const name = toks[i];
+    if (name === undefined) continue;
+    if (name.kind !== 'ident' && name.kind !== 'quotedIdent') continue;
+    let j = i + 1;
+    // `name (col, col) AS (…)` is legal too; skip the column list.
+    if (toks[j]?.kind === 'punct' && toks[j]?.value === '(') {
+      let d = 0;
+      while (j < toks.length) {
+        const x = toks[j];
+        if (x?.kind === 'punct' && x.value === '(') d++;
+        else if (x?.kind === 'punct' && x.value === ')') {
+          d--;
+          if (d === 0) {
+            j++;
+            break;
+          }
+        }
+        j++;
+      }
+    }
+    if (toks[j]?.kind !== 'ident' || lower(toks[j]?.value ?? '') !== 'as') continue;
+    if (toks[j + 1]?.kind !== 'punct' || toks[j + 1]?.value !== '(') continue;
+    names.add(lower(name.value));
+  }
+  return names;
 }
 
 /**

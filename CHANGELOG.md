@@ -4,6 +4,109 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-08-09
+
+An audit of the commit path — `apply.ts`, `store.ts`, `serialize.ts`, `card.ts`,
+the MCP entry point — which the previous round had not examined. `apply.ts` is
+the only code here that changes production data: the dry run always rolls back
+and approval only writes a record. It produced twenty-three confirmed defects.
+
+### If you ran 0.4.0 or earlier, check this in your own data
+
+1. **An `UPDATE` that assigned a column the value it already held.** That column
+   was written on every execution and verified on none: it was absent from the
+   card, from the digest, and from both the pre-apply comparison and the
+   read-back. If another session changed it between approval and apply, the apply
+   silently wrote the stale value back and reported success. Zero-padded codes,
+   status columns set defensively, `SET x = x` idioms — those are the shape.
+2. **On PostgreSQL and SQLite, a row the card described as "already correct".**
+   Same hole, whole row: nothing about its contents was checked before or after
+   the write. On MySQL this case was caught; on the other two it was not.
+3. **A long text column, a BLOB, or a large JSON document on a card.** Two
+   different values could render as the same line — `'aaa...' -> 'aaa...'` — so a
+   real change was displayed as no change on the line you were reading.
+
+### Fixed
+
+- **A column assigned its own current value was written unverified.** `changed`
+  is what the trial measured as different; the statement writes what it
+  *assigns*, and those are not the same set. Both verification loops iterated
+  `changed`. Measured: `UPDATE customers SET name='new', postcode='00100'` on a
+  row already holding `'00100'`, approved as "1 column: name", with another
+  session correcting the postcode in between — the apply wrote `'00100'` back
+  over the correction and returned success. `PlanRow` now carries `covered`,
+  every column the statement assigns, snapshotted before and after and verified
+  at both ends. `changed` still drives the display, because widening that would
+  make the card claim a change where there is none.
+
+- **Rows the card called "already correct" were committed unchecked** on
+  PostgreSQL and SQLite, where the rows-changed reconciliation is meaningless and
+  so is skipped. Covered by the same change.
+
+- **Assigning a column declared in `autoColumns` is now refused.** Such columns
+  are excluded from the diff by design (D8), so a statement that assigned one put
+  an arbitrary value into the row with nothing on the card to show for it — and
+  `autoColumns` is a config key a model can read.
+
+- **`Applier.apply` had no latch**, though `Engine.plan` was given one in 0.4.0 —
+  the same fix written for one of two siblings and not the other, which is the
+  third time that shape has appeared here. Its nesting guard sat four `await`s
+  from the `begin()` it guarded.
+
+- **The apply ran at the connection's default isolation**, which on PostgreSQL is
+  `READ COMMITTED` — under which the row this transaction has just verified can be
+  replaced by another session's commit before the `UPDATE` reaches it. The dry run
+  has always asked for `repeatable-read`; the half that keeps its result did not.
+
+- **`applyLimits` and `begin` sat outside the try block**, after the plan had been
+  claimed and the `attempting` record written — so a throw there wedged the plan
+  in `applying` for ever, with no rollback, no `failed` transition and no failure
+  record.
+
+- **A trigger created between plan and apply was not re-checked**, though the
+  cascade and storage-engine checks are re-run from a fresh introspect for exactly
+  that reason. A trigger can write any column of the row, or any row of another
+  table, and none of it is on the card.
+
+- **The card could be forged, and could hide a change.** Values and the statement
+  went to the terminal unescaped, so a newline let a value draw the lines beneath
+  it — a complete second card above the real one. Long values were truncated at
+  the same length on both sides of the diff, so two different values rendered
+  identically; they now carry their length and a digest. A SQLite `BLOB` arrives
+  as a plain `Uint8Array`, which the binary branch did not match, so the same plan
+  rendered one card in the process that proposed it and another in the process
+  that approved it.
+
+- **`connection.schema` was dropped by the config parser**, which made 0.4.0's
+  `search_path` fix inert for anyone configuring it from a file. Unknown keys in a
+  connection block are now refused rather than ignored, for the same reason: a
+  typo in a security-relevant setting must not read as "not configured".
+
+- **A float column holding `NaN` or `±Infinity`** did not survive the plan's JSON
+  encoding — all three became `null` — so every plan touching that table was
+  refused as tampered.
+
+- **The forbidden-word list was matched against unquoted identifiers only**, so
+  quoting the name bypassed it: `"nextval"`, `"pg_read_file"`,
+  `"information_schema"`.
+
+- **`SELECT` was reported as a table name** for any read with a derived table
+  (`FROM (SELECT …) x`), and CTE names were treated as tables — so every `WITH`
+  statement was refused as not allowlisted, and SPEC R5 could not hold. A CTE's
+  body is still scanned, so `WITH x AS (SELECT * FROM secrets) SELECT * FROM x`
+  still reports `secrets`.
+
+- **`Engine.read` tested the concurrency latch without taking it**, so a dry run
+  starting while a read was in flight still put that read inside the trial
+  transaction.
+
+- **The MCP server's lazy session opener raced with itself** (`session ??= await
+  …` tests and assigns on opposite sides of an await), so two early tool calls
+  opened two sessions — two engines, two latches, neither aware of the other, and
+  every session but the last leaked.
+
+- **`columnsTouched` was printed on the card and left out of the digest.**
+
 ## [0.4.0] — 2026-08-09
 
 ### If you ran 0.1.0 – 0.3.1, check this in your own data
@@ -514,6 +617,7 @@ produced a plan describing something other than what would happen:
 - No runtime dependencies. Drivers are optional peers; the MCP server implements
   the wire protocol directly.
 
+[0.4.1]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.4.1
 [0.4.0]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.4.0
 [0.3.1]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.3.1
 [0.3.0]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.3.0

@@ -1,5 +1,5 @@
 import { normalize, Rejected } from './normalize.js';
-import { tableRefs, setColumns, whereClause, lower } from './statement.js';
+import { tableRefs, setColumns, setColumnsAreCertain, whereClause, lower } from './statement.js';
 import { PolicyViolation, type Policy } from './policy.js';
 import type { Adapter, Row, TableShape } from './adapter.js';
 import { sameValue as same } from './compare.js';
@@ -33,6 +33,7 @@ export type RefusalCode =
   | 'ROLLBACK_FAILED'
   | 'BUSY'
   | 'NO_SUCH_COLUMN'
+  | 'AUTO_COLUMN_ASSIGNED'
   | 'NOT_TRANSACTIONAL'
   | 'CASCADE_SIDE_EFFECTS'
   | 'ADAPTER_UNUSABLE';
@@ -48,11 +49,30 @@ export class PlanRefused extends Refusal {
 export interface PlanRow {
   /** Primary key values identifying this row. */
   readonly key: Row;
-  /** Columns that really differ, with auto-maintained ones removed. */
+  /** Columns that really differ, with auto-maintained ones removed. This is what the card shows. */
   readonly changed: readonly string[];
-  /** For UPDATE, the changed columns only. For DELETE, every column. */
+  /**
+   * Every column this statement writes to this row — which is not the same set.
+   *
+   * `UPDATE t SET name = 'x', postcode = '00100'` against a row already holding
+   * `'00100'` produces `changed: ['name']`, because the trial measured no
+   * difference in `postcode`. The statement still assigns it on every execution.
+   *
+   * That gap was reachable and was measured: the apply's pre-write comparison and
+   * its read-back both iterated `changed`, so between approval and apply another
+   * session could correct `postcode` to `'90210'` and the apply would write
+   * `'00100'` back over it — unverified, absent from the card, and reported as
+   * success. The same hole covered whole rows on PostgreSQL and SQLite, where the
+   * card says "already correct" about rows whose `changed` is empty.
+   *
+   * So the snapshot covers every assigned column, and the apply verifies all of
+   * them. `changed` still drives the display, because widening that would make the
+   * card claim a change where there is none.
+   */
+  readonly covered: readonly string[];
+  /** For UPDATE, the covered columns. For DELETE, every column. */
   readonly before: Row;
-  /** For UPDATE, the changed columns only. Empty for DELETE. */
+  /** For UPDATE, the covered columns. Empty for DELETE. */
   readonly after: Row;
 }
 
@@ -269,14 +289,26 @@ export class Engine {
     // dry run, and surfaced as a raw driver error rather than as a refusal.
     // Checking it here costs one comparison against metadata already fetched, and
     // it fails before anything runs.
+    const assigned: string[] = op === 'UPDATE' ? setColumns(stmt.tokens) : [];
     if (op === 'UPDATE') {
       const known = new Set(shape.columns.map((c) => lower(c.name)));
-      const unknown = setColumns(stmt.tokens).filter((c) => !known.has(lower(c)));
+      const unknown = assigned.filter((c) => !known.has(lower(c)));
       if (unknown.length > 0) {
         throw new PlanRefused(
           'NO_SUCH_COLUMN',
           `Table \`${table}\` has no column ${unknown.map((c) => `\`${c}\``).join(', ')}. ` +
             `It has: ${shape.columns.map((c) => c.name).join(', ')}.`,
+        );
+      }
+      // The SET clause has to be readable for the snapshot below to be complete.
+      // Reporting a partial list here would be worse than reporting none: the
+      // apply would verify the columns it was told about and write the rest.
+      if (!setColumnsAreCertain(stmt.tokens)) {
+        throw new PlanRefused(
+          'NO_SUCH_COLUMN',
+          'Part of this SET clause could not be read as a column assignment, so the columns this statement ' +
+            'writes cannot be listed — and every one of them has to be checked before the apply. Rewrite it ' +
+            'as plain `column = value` assignments.',
         );
       }
     }
@@ -310,6 +342,24 @@ export class Engine {
     }
 
     const auto = this.resolveAutoColumns(table, shape);
+
+    // D8 again, from the other side. A column the engine has been told maintains
+    // itself is dropped from the diff — that is the point of the rule. If the
+    // statement *assigns* it too, dropping it silently means an arbitrary value
+    // reaches the row without ever appearing on the card, and `autoColumns` is a
+    // config key a model can read in the repository. Refuse rather than hide it.
+    if (op === 'UPDATE') {
+      const alsoAuto = assigned.filter((c) => auto.has(lower(c)));
+      if (alsoAuto.length > 0) {
+        throw new PlanRefused(
+          'AUTO_COLUMN_ASSIGNED',
+          `This statement assigns ${alsoAuto.map((c) => `\`${c}\``).join(', ')}, which is declared as ` +
+            'maintained by the database. Such columns are excluded from the diff, so the value would be ' +
+            'written without appearing on the card. Remove it from the SET clause, or from autoColumns.',
+        );
+      }
+    }
+
 
     // D6 — never nest. Measured: on MySQL a rolled-back statement keeps its row
     // locks until the caller's transaction ends. Postgres releases them, but the
@@ -398,7 +448,7 @@ export class Engine {
       }
     }
 
-    return this.build(stmt.sql, table, op, pk, before, after, auto, matched, changedReported, changedMeaningful);
+    return this.build(stmt.sql, table, op, pk, before, after, auto, assigned, matched, changedReported, changedMeaningful);
   }
 
   /**
@@ -416,21 +466,31 @@ export class Engine {
    * shape of the whole schema from a tool whose entire premise is default-deny.
    */
   async read(rawSql: string, opts: { limit?: number } = {}): Promise<ReadResult> {
-    if (this.poisoned !== undefined) {
-      throw new PlanRefused('ADAPTER_UNUSABLE', `This connection will not be used again: ${this.poisoned}`);
-    }
-    // A read on the connection a dry run is currently holding would be served
-    // from inside that transaction, and would report the trial's uncommitted
-    // values as the contents of the database. The card would then be confirmed by
-    // a "current state" that only exists because we are pretending. With a
-    // separate read connection there is nothing to collide with, which is one
-    // more reason to configure one.
-    if (this.busy !== undefined && !this.readIsSeparate) {
+    // Held for the duration when reads share the planning connection, not merely
+    // tested on the way in. Testing alone stopped a read that began after a dry
+    // run had the latch, and did nothing about a dry run that began while a read
+    // was in flight — the driver serialises statements on one connection, so
+    // that read's SELECT lands inside the trial transaction and returns its
+    // uncommitted values as fact.
+    if (this.readIsSeparate) return this.readExclusive(rawSql, opts);
+    if (this.busy !== undefined) {
       throw new PlanRefused(
         'BUSY',
         `${this.busy} is holding this connection, so a read now would return its uncommitted trial values ` +
           'as fact. Configure readConnection so reads have a connection of their own, or read afterwards.',
       );
+    }
+    this.busy = 'A read';
+    try {
+      return await this.readExclusive(rawSql, opts);
+    } finally {
+      this.busy = undefined;
+    }
+  }
+
+  private async readExclusive(rawSql: string, opts: { limit?: number } = {}): Promise<ReadResult> {
+    if (this.poisoned !== undefined) {
+      throw new PlanRefused('ADAPTER_UNUSABLE', `This connection will not be used again: ${this.poisoned}`);
     }
     if (!this.readChecked) {
       // A separate read connection is verified as a read connection. Asking it
@@ -591,6 +651,7 @@ export class Engine {
     before: Row[],
     after: Row[],
     auto: ReadonlySet<string>,
+    assigned: readonly string[],
     matched: number,
     changedReported: number,
     changedMeaningful: boolean,
@@ -608,7 +669,7 @@ export class Engine {
         // D11 — every column, including the ones that are null right now. Dropping
         // them from the display also drops them from the pre-apply comparison, and
         // a value written in between would then be deleted unseen.
-        rows.push({ key, changed: Object.keys(b), before: { ...b }, after: {} });
+        rows.push({ key, changed: Object.keys(b), covered: Object.keys(b), before: { ...b }, after: {} });
         for (const c of Object.keys(b)) touched.add(c);
         rowsWithAnyDiff++;
         continue;
@@ -628,13 +689,27 @@ export class Engine {
         touched.add(c);
       }
       if (anyDiff) rowsWithAnyDiff++;
+
+      // Everything the statement writes, whether or not the trial saw it move.
+      // A column assigned its own current value is still assigned on the real
+      // execution, so the apply has to hold a before-image of it — otherwise it
+      // writes over whatever the column holds by then, having verified nothing.
+      // Auto-maintained columns stay out: the statement cannot be assigning one,
+      // because that is refused before the trial runs.
+      const covered = [...changed];
+      for (const c of assigned) {
+        const actual = Object.keys(b).find((k) => lower(k) === lower(c));
+        if (actual === undefined || auto.has(lower(actual))) continue;
+        if (!covered.some((x) => lower(x) === lower(actual))) covered.push(actual);
+      }
+
       const bd: Row = {};
       const ad: Row = {};
-      for (const c of changed) {
+      for (const c of covered) {
         bd[c] = b[c];
         ad[c] = a[c];
       }
-      rows.push({ key, changed, before: bd, after: ad });
+      rows.push({ key, changed, covered, before: bd, after: ad });
     }
 
     if (touched.size === 0) {

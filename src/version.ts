@@ -4,4 +4,4 @@
  * path that depends on how the package was bundled. A constant cannot fail at
  * runtime. RELEASING.md pins it to the version in package.json.
  */
-export const VERSION = '0.4.0';
+export const VERSION = '0.4.1';

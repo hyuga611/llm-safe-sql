@@ -1,7 +1,7 @@
 import type { Adapter, Row } from './adapter.js';
 import { sameValue as same } from './compare.js';
 import { planDigest } from './digest.js';
-import type { Plan, RefusalCode } from './engine.js';
+import type { Plan, PlanRow, RefusalCode } from './engine.js';
 import { keyOf, keyPredicate, qname } from './keys.js';
 import { normalize } from './normalize.js';
 import type { Policy } from './policy.js';
@@ -89,6 +89,17 @@ export class Applier {
   private readonly limits: Required<NonNullable<ApplierOptions['limits']>>;
   private checked: boolean;
   private poisoned: string | undefined;
+  /**
+   * What currently owns the applying connection, if anything.
+   *
+   * The same latch `Engine.plan` takes, for the same reason, and its absence here
+   * was the same omission a third time: a fix written for one of two siblings.
+   * The nesting guard below sits four `await`s before the `begin()` it guards, so
+   * two applies on one Applier both saw "no transaction" and both opened one —
+   * and on MySQL the second `START TRANSACTION` commits the first, which here
+   * means committing a write whose verification had not finished.
+   */
+  private busy: string | undefined;
 
   constructor(opts: ApplierOptions) {
     this.adapter = opts.adapter;
@@ -157,6 +168,23 @@ export class Applier {
    *  7. commit
    */
   async apply(id: string, actor: string): Promise<ApplyResult> {
+    // Taken before the first await, which is what makes it a latch.
+    if (this.busy !== undefined) {
+      throw new ApplyRefused(
+        'BUSY',
+        `${this.busy} is already running on this connection. An apply owns the transaction it verifies in, ` +
+          'so they cannot overlap. Run one at a time, or give each caller its own session.',
+      );
+    }
+    this.busy = 'An apply';
+    try {
+      return await this.applyExclusive(id, actor);
+    } finally {
+      this.busy = undefined;
+    }
+  }
+
+  private async applyExclusive(id: string, actor: string): Promise<ApplyResult> {
     if (this.poisoned !== undefined) {
       throw new ApplyRefused(
         'ADAPTER_UNUSABLE',
@@ -213,6 +241,21 @@ export class Applier {
       );
     }
 
+    // A trigger created since the plan was measured changes what this statement
+    // does — it can write any column of this row, or any row of another table,
+    // and none of that is on the card. The cascade and storage-engine checks
+    // above are re-run from a fresh introspect for exactly this reason; triggers
+    // were left out of the same re-check, though the engine refuses to plan at
+    // all when it cannot say which columns move by themselves.
+    if (plan.op === 'UPDATE' && !shape.autoColumnsKnown) {
+      throw new ApplyRefused(
+        'SCHEMA_CHANGED',
+        `\`${table}\` now has ${shape.triggerCount} trigger(s), so which columns move by themselves can no ` +
+          'longer be determined. That was not true when this plan was measured, so it no longer describes ' +
+          'what would happen. Make a new plan.',
+      );
+    }
+
     const pk = shape.primaryKey;
     const planKeyCols = Object.keys(plan.rows[0]?.key ?? {});
     if (pk.length === 0 || !sameSet(pk, planKeyCols)) {
@@ -255,14 +298,29 @@ export class Applier {
       );
     }
 
-    await this.adapter.applyLimits(this.limits); // A9
     const q = this.adapter.quoteIdent.bind(this.adapter);
     const dialect = this.adapter.dialect;
 
     let rowsAffected = 0;
     let committed = false;
-    await this.adapter.begin('default');
+    let opened = false;
     try {
+      // Inside the try, both of them. The plan has been claimed and an
+      // `attempting` record written by this point, so a throw out here left it
+      // wedged in `applying` for ever — no rollback, no `failed` transition, no
+      // `failed` audit record, and a raw driver error where a refusal belongs.
+      // A dropped connection between the audit write and the first statement is
+      // all it takes.
+      await this.adapter.applyLimits(this.limits); // A9
+      // A4a — repeatable read, not the connection default. The check and the
+      // write are two statements against the same rows, and on PostgreSQL the
+      // default is READ COMMITTED, under which the row this transaction verified
+      // can be replaced by another session's commit before the UPDATE reaches
+      // it. The engine's dry run has always asked for `repeatable-read` for this
+      // reason; the apply, which is the half that keeps its result, asked for
+      // the default.
+      await this.adapter.begin('repeatable-read');
+      opened = true;
       // A3 + A4 in one locking read. Doing it as two queries leaves a gap in
       // which the row set can change between "which rows are these" and "are
       // they still what you saw".
@@ -284,12 +342,18 @@ export class Applier {
       for (const pr of plan.rows) {
         const live = liveByKey.get(keyOf(pk, pr.key));
         if (live === undefined) continue; // impossible after the check above
-        // Only the columns that were part of the approval. For UPDATE that is
-        // the columns being changed: another team's edit to an unrelated column
-        // is not a reason to refuse, and refusing would be a false alarm that
-        // teaches people to bypass this. For DELETE `before` holds every column,
-        // because the whole row is what is being destroyed.
-        for (const c of pr.changed) {
+        // Every column this statement writes, not only the ones the trial saw
+        // move. `changed` is what the card displays; `covered` is what the
+        // statement assigns, and a column assigned its own current value is
+        // assigned again here. Iterating `changed` meant such a column was
+        // written with no before-image checked at all — measured: a postcode
+        // corrected by another session between approval and apply was silently
+        // reverted, and the apply reported success. Columns outside the SET
+        // clause are still ignored, which is the original point: another team's
+        // edit to an unrelated column is not a reason to refuse, and refusing
+        // would be a false alarm that teaches people to bypass this. For DELETE
+        // `covered` is every column, because the whole row is being destroyed.
+        for (const c of coveredOf(pr)) {
           if (!same(live[c], pr.before[c])) {
             throw new ApplyRefused(
               'ROW_CHANGED',
@@ -341,7 +405,7 @@ export class Applier {
               `Row ${describeKey(pr.key)} disappeared during the apply. Everything has been rolled back.`,
             );
           }
-          for (const c of pr.changed) {
+          for (const c of coveredOf(pr)) {
             if (!same(got[c], pr.after[c])) {
               throw new ApplyRefused(
                 'RESULT_MISMATCH',
@@ -356,7 +420,11 @@ export class Applier {
       await this.adapter.commit();
       committed = true;
     } catch (e) {
-      if (!committed) {
+      // `opened` guards the rollback: if the throw came from applyLimits or from
+      // begin() itself there is no transaction to undo, and rolling back a
+      // connection that never opened one would replace the real cause with a
+      // driver error about that.
+      if (!committed && opened) {
         try {
           await this.adapter.rollback();
         } catch (r) {
@@ -472,6 +540,18 @@ function sameSet(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
   const s = new Set(a.map(lower));
   return b.every((x) => s.has(lower(x)));
+}
+
+/**
+ * The columns of a row this apply must verify.
+ *
+ * `covered` was added in 0.4.1; a plan stored by an earlier version does not
+ * carry it, and the digest changed in the same release so such a plan cannot be
+ * applied anyway. Falling back to `changed` keeps the shape total rather than
+ * throwing somewhere less legible.
+ */
+function coveredOf(pr: PlanRow): readonly string[] {
+  return pr.covered.length > 0 ? pr.covered : pr.changed;
 }
 
 function describeKey(key: Row): string {

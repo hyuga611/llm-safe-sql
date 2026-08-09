@@ -480,6 +480,94 @@ describe('sqlite', { skip }, () => {
     })();
   });
 
+  test('a column assigned its own value is still verified before the apply writes it', async () => {
+    // The card shows what CHANGED. The statement writes what it ASSIGNS, and the
+    // two differ whenever a column is set to the value it already holds. Both the
+    // pre-apply comparison and the read-back used to iterate the displayed set,
+    // so such a column was written having been checked against nothing: another
+    // session correcting it between approval and apply had its correction
+    // reverted, off the card, and the apply reported success.
+    await bookkeeping.query('DROP TABLE IF EXISTS assigned');
+    await bookkeeping.query('CREATE TABLE assigned (id INTEGER PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL)');
+    await bookkeeping.query("INSERT INTO assigned VALUES (1, 'old', '00100')");
+    const pol = new Policy({ allow: ['assigned'], impact: { assigned: 'test table' } });
+    const e = new Engine({ adapter: planning, policy: pol });
+    const store = new SqlPlanStore({ adapter: bookkeeping });
+    await store.migrate();
+    const applier = new Applier({ adapter: planning, policy: pol, store });
+
+    const plan = await e.plan("UPDATE assigned SET name = 'new', code = '00100' WHERE id = 1");
+    assert.deepEqual(plan.rows[0]?.changed, ['name'], 'only name really differs, so only name is displayed');
+    assert.deepEqual(
+      [...(plan.rows[0]?.covered ?? [])].sort(),
+      ['code', 'name'],
+      'but both are written, so both must be covered',
+    );
+
+    const rec = await applier.record(plan, 'model');
+    await applier.approve(rec.id, 'operator');
+    // Somebody corrects the code in the meantime.
+    await bookkeeping.query("UPDATE assigned SET code = '90210' WHERE id = 1");
+
+    await assert.rejects(
+      () => applier.apply(rec.id, 'operator'),
+      (err: unknown) => (err as { code?: string }).code === 'ROW_CHANGED',
+      'the apply must refuse rather than write the stale value back',
+    );
+    const [row] = await bookkeeping.query<Row>('SELECT code FROM assigned WHERE id = 1');
+    assert.equal(row?.['code'], '90210', 'and the correction must still be there');
+  });
+
+  test('a row the card calls "already correct" is verified too', async () => {
+    // On PostgreSQL and SQLite the rows-changed reconciliation is meaningless, so
+    // a row whose `changed` is empty had nothing checked before or after the
+    // write. The card advertises those rows as harmless — "1 more match the
+    // condition but are already correct" — while the statement rewrites them.
+    await bookkeeping.query('DROP TABLE IF EXISTS batch');
+    await bookkeeping.query('CREATE TABLE batch (id INTEGER PRIMARY KEY, status TEXT NOT NULL, note TEXT NOT NULL)');
+    await bookkeeping.query("INSERT INTO batch VALUES (1,'new','b7'), (2,'shipped','b7')");
+    const pol = new Policy({ allow: ['batch'], impact: { batch: 'test table' } });
+    const e = new Engine({ adapter: planning, policy: pol });
+    const store = new SqlPlanStore({ adapter: bookkeeping });
+    await store.migrate();
+    const applier = new Applier({ adapter: planning, policy: pol, store });
+
+    const plan = await e.plan("UPDATE batch SET status = 'shipped' WHERE note = 'b7'");
+    assert.equal(plan.rows.length, 2);
+    const quiet = plan.rows.find((r) => r.changed.length === 0);
+    assert.ok(quiet !== undefined, 'row 2 already holds the value, so it displays as no change');
+    assert.deepEqual(quiet.covered, ['status'], 'and it is still written, so it is still covered');
+
+    const rec = await applier.record(plan, 'model');
+    await applier.approve(rec.id, 'operator');
+    await bookkeeping.query("UPDATE batch SET status = 'CANCELLED' WHERE id = 2");
+
+    await assert.rejects(
+      () => applier.apply(rec.id, 'operator'),
+      (err: unknown) => (err as { code?: string }).code === 'ROW_CHANGED',
+    );
+    const [row] = await bookkeeping.query<Row>('SELECT status FROM batch WHERE id = 2');
+    assert.equal(row?.['status'], 'CANCELLED', 'the cancellation must not be reverted');
+  });
+
+  test('assigning a column declared auto-maintained is refused, not hidden', async () => {
+    // Auto columns are dropped from the diff by design (D8). A statement that
+    // assigns one would then put an arbitrary value in the row with nothing on
+    // the card to show for it — and autoColumns is a config key a model can read.
+    await bookkeeping.query('DROP TABLE IF EXISTS autoassign');
+    await bookkeeping.query('CREATE TABLE autoassign (id INTEGER PRIMARY KEY, v INTEGER, updated_at TEXT)');
+    await bookkeeping.query("INSERT INTO autoassign VALUES (1, 1, '2020-01-01')");
+    const e = new Engine({
+      adapter: planning,
+      policy: new Policy({ allow: ['autoassign'], impact: { autoassign: 'test table' } }),
+      autoColumns: { autoassign: ['updated_at'] },
+    });
+    await assert.rejects(
+      () => e.plan("UPDATE autoassign SET v = 2, updated_at = '1999-01-01' WHERE id = 1"),
+      (err: unknown) => (err as { code?: string }).code === 'AUTO_COLUMN_ASSIGNED',
+    );
+  });
+
   // =====================================================================
   //  One at a time, per connection.
   // =====================================================================

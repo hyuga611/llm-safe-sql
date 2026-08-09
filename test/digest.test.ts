@@ -22,7 +22,7 @@ const base: Plan = {
   dialect: 'postgres',
   table: 'orders',
   op: 'UPDATE',
-  rows: [{ key: { id: 1 }, changed: ['qty'], before: { qty: 10 }, after: { qty: 99 } }],
+  rows: [{ key: { id: 1 }, changed: ['qty'], covered: ['qty'], before: { qty: 10 }, after: { qty: 99 } }],
   columnsTouched: ['qty'],
   rowsMatched: 1,
   rowsChanged: 1,

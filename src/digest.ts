@@ -29,11 +29,11 @@ import type { Plan } from './engine.js';
  */
 export function planDigest(plan: Plan): string {
   const parts: string[] = [
-    // Bumped from v1 when impact and warnings were added. Plans stored by an
+    // v2 added impact and warnings; v3 added the covered-column snapshot. Plans stored by an
     // older version no longer verify, which is the correct direction to fail: a
     // plan whose covered surface is smaller than this version believes is a plan
     // this version cannot vouch for.
-    'llm-safe-sql/plan/v2',
+    'llm-safe-sql/plan/v3',
     plan.dialect,
     plan.op,
     plan.table,
@@ -42,6 +42,11 @@ export function planDigest(plan: Plan): string {
     String(plan.rowsChanged),
     String(plan.rowsChangedIsMeaningful),
     plan.impact,
+    // Printed on the card as "across N columns: a, b", and read back from the
+    // stored body verbatim rather than re-derived, so it was editable without
+    // breaking the checksum.
+    String(plan.columnsTouched.length),
+    ...[...plan.columnsTouched].sort(),
     // Order is meaningful here — it is the order they are printed in.
     String(plan.warnings.length),
     ...plan.warnings,
@@ -56,6 +61,13 @@ export function planDigest(plan: Plan): string {
     // agreed; the values are.
     for (const c of [...r.changed].sort()) {
       parts.push('col', c, canonical(r.before[c]), canonical(r.after[c]));
+    }
+    // And every column the statement writes, which is a wider set: a column
+    // assigned its own current value is not in `changed` and is still written.
+    // The apply verifies these before and after, so a stored plan with one of
+    // them removed would have that column written unchecked.
+    for (const c of [...r.covered].sort()) {
+      parts.push('cov', c, canonical(r.before[c]), canonical(r.after[c]));
     }
   }
 

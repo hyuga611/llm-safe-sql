@@ -36,7 +36,17 @@ interface Tagged {
 export function encodeValue(v: unknown): Tagged {
   if (v === null || v === undefined) return { t: 'null' };
   if (typeof v === 'string') return { t: 's', v };
-  if (typeof v === 'number') return { t: 'n', v };
+  if (typeof v === 'number') {
+    // JSON has no NaN and no Infinity: `JSON.stringify` turns all three into
+    // `null`. The plan read back for approval then differed from the plan that
+    // was stored, and every plan touching such a column was refused as tampered —
+    // an accusation of tampering caused by a float column holding a value floats
+    // are allowed to hold.
+    if (!Number.isFinite(v)) {
+      return { t: 'nonfinite', v: Number.isNaN(v) ? 'NaN' : v > 0 ? 'Infinity' : '-Infinity' };
+    }
+    return { t: 'n', v };
+  }
   if (typeof v === 'boolean') return { t: 'bool', v };
   if (typeof v === 'bigint') return { t: 'big', v: v.toString() };
   if (v instanceof Date) return { t: 'date', v: v.toISOString() };
@@ -56,6 +66,8 @@ export function decodeValue(x: unknown): unknown {
   switch (tag.t) {
     case 'null': return null;
     case 's': case 'n': case 'bool': case 'json': return tag.v;
+    case 'nonfinite':
+      return String(tag.v) === 'NaN' ? Number.NaN : String(tag.v) === 'Infinity' ? Infinity : -Infinity;
     case 'big': return BigInt(String(tag.v));
     case 'date': return new Date(String(tag.v));
     case 'buf': return Buffer.from(String(tag.v), 'hex');
@@ -93,6 +105,7 @@ export function encodePlan(plan: Plan): string {
     rows: plan.rows.map((r) => ({
       key: encodeRow(r.key),
       changed: r.changed,
+      covered: r.covered,
       before: encodeRow(r.before),
       after: encodeRow(r.after),
     })),
@@ -106,6 +119,7 @@ export function decodePlan(text: string): Plan {
     return {
       key: decodeRow(o['key']),
       changed: Array.isArray(o['changed']) ? (o['changed'] as string[]) : [],
+      covered: Array.isArray(o['covered']) ? (o['covered'] as string[]) : [],
       before: decodeRow(o['before']),
       after: decodeRow(o['after']),
     };

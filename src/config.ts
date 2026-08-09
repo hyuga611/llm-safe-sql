@@ -185,12 +185,31 @@ function connectionOf(raw: unknown, path: string, dialect: Dialect): ConnectionC
   }
   const port = Number(o['port']);
   if (!Number.isInteger(port) || port <= 0) throw new ConfigError(`${path}.port must be a port number.`);
+  // `schema` is copied through, not dropped. It was dropped in the change that
+  // introduced it, which made the whole setting inert from a config file: the
+  // adapter fell back to `public` on every connection, and `connectionIdentity`
+  // — which reports two roles as separated partly by schema — compared two
+  // objects that no longer had one. An unknown key is refused rather than
+  // ignored, for the same reason: a typo in a security-relevant setting must not
+  // read as "not configured".
+  const known = new Set(['host', 'port', 'user', 'password', 'database', 'schema']);
+  const unknown = Object.keys(o).filter((k) => !known.has(k));
+  if (unknown.length > 0) {
+    throw new ConfigError(
+      `${path} has ${unknown.map((k) => `"${k}"`).join(', ')}, which ${unknown.length === 1 ? 'is not a setting' : 'are not settings'} ` +
+        `this library knows. Valid keys are: ${[...known].join(', ')}. A misspelled key would otherwise be ignored silently.`,
+    );
+  }
+  if (o['schema'] !== undefined && (typeof o['schema'] !== 'string' || o['schema'] === '')) {
+    throw new ConfigError(`${path}.schema must be a schema name.`);
+  }
   return {
     host: String(o['host']),
     port,
     user: String(o['user']),
     password: String(o['password'] ?? ''),
     database: String(o['database']),
+    ...(o['schema'] === undefined ? {} : { schema: String(o['schema']) }),
   };
 }
 

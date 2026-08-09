@@ -24,7 +24,7 @@ const stored: StoredPlan = {
     dialect: 'postgres',
     table: 'orders',
     op: 'UPDATE',
-    rows: [{ key: { id: 42 }, changed: ['status'], before: { status: 'pending' }, after: { status: 'shipped' } }],
+    rows: [{ key: { id: 42 }, changed: ['status'], covered: ['status'], before: { status: 'pending' }, after: { status: 'shipped' } }],
     columnsTouched: ['status'],
     rowsMatched: 1,
     rowsChanged: 1,

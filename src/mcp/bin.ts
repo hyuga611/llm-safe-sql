@@ -74,10 +74,21 @@ async function main(): Promise<void> {
   // Connections are opened lazily so a database that is down produces a clear
   // error on the first tool call, rather than a server that refuses to start and
   // shows up in the client as "failed to connect" with nothing to read.
-  let session: ReadSession | undefined;
-  const open = async (): Promise<ReadSession> => {
-    session ??= await openReadSession(cfg);
-    return session;
+  // The promise is memoised, not the resolved value. `session ??= await open()`
+  // tests and assigns on opposite sides of an await, so two tool calls arriving
+  // before the first connection finished both saw `undefined` and both opened a
+  // session — two Engines, each with its own latch, neither aware of the other,
+  // and the guard against two dry runs sharing a connection could not fire
+  // because they were not sharing one. It also leaked every session but the last.
+  let opening: Promise<ReadSession> | undefined;
+  const open = (): Promise<ReadSession> => {
+    opening ??= openReadSession(cfg).catch((e: unknown) => {
+      // A failed attempt must not be cached, or a database that was briefly down
+      // stays down for the life of the process.
+      opening = undefined;
+      throw e;
+    });
+    return opening;
   };
 
   const tools: McpTools = {
@@ -105,8 +116,14 @@ async function main(): Promise<void> {
   process.stderr.write(`llm-safe-sql ${VERSION} — ${cfg.dialect}, ${cfg.policy.allow.length} table(s) allowed\n`);
 
   const shutdown = (): void => {
-    void session?.close().finally(() => process.exit(0));
-    if (session === undefined) process.exit(0);
+    if (opening === undefined) {
+      process.exit(0);
+      return;
+    }
+    // Await the same promise the tool calls use, so a shutdown arriving while
+    // the connection is still opening still closes it rather than leaving it to
+    // the operating system.
+    void opening.then((s) => s.close()).catch(() => undefined).finally(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

@@ -1,6 +1,6 @@
 {
   "name": "@hyuga/llm-safe-sql",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Let an LLM propose UPDATE/DELETE, then actually run it, measure the real before/after diff, and always roll back — so the human approves measured facts, not the model's claim.",
   "main": "dist/src/index.js",

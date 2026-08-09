@@ -124,3 +124,25 @@ export function decodePlan(text: string): Plan {
     warnings: Array.isArray(raw['warnings']) ? (raw['warnings'] as string[]) : [],
   };
 }
+
+/**
+ * A `JSON.stringify` replacer for showing rows to a human or to a model.
+ *
+ * Distinct from {@link encodeValue}, which exists to round-trip a value back
+ * into the same type. This one only has to be readable and honest — but it does
+ * have to exist, because `JSON.stringify` throws on a `bigint` rather than
+ * degrading, and every integer SQLite returns is one. Printing a row from a
+ * table with a 64-bit id would otherwise crash the command that printed it.
+ *
+ * Binary is summarised rather than dumped: a megabyte of hex helps nobody, and
+ * pasting it into a model's context is worse than useless.
+ */
+export function displayReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'bigint') return value.toString();
+  if (value instanceof Uint8Array) return `<${value.length} bytes of binary>`;
+  if (value !== null && typeof value === 'object' && (value as { type?: string }).type === 'Buffer') {
+    const data = (value as { data?: number[] }).data ?? [];
+    return `<${data.length} bytes of binary>`;
+  }
+  return value;
+}

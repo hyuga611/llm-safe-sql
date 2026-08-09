@@ -20,11 +20,11 @@
  *     are not harmless: they pressure the operator into deleting the blocklist.
  */
 
-export type Dialect = 'mysql' | 'postgres';
+export type Dialect = 'mysql' | 'postgres' | 'sqlite';
 
 export type TokenKind =
   | 'ident' //        bare word: table, column, keyword
-  | 'quotedIdent' //  `x` (MySQL) or "x" (Postgres) — still an identifier
+  | 'quotedIdent' //  `x` (MySQL, SQLite), "x" (Postgres, SQLite), [x] (SQLite)
   | 'string' //       '...' , "..." (MySQL), E'...' / $tag$...$tag$ (Postgres)
   | 'number'
   | 'punct'
@@ -63,11 +63,11 @@ function isIdentStart(c: string): boolean {
 
 function isIdentPart(c: string, dialect: Dialect): boolean {
   if (isIdentStart(c) || isDigit(c)) return true;
-  // MySQL allows `$` inside identifiers. In Postgres `$` also may appear inside an
-  // identifier, but `$tag$` starts a dollar-quoted string — so we stop before `$`
-  // there and let the dollar-quote branch decide. Splitting an identifier is
-  // harmless; swallowing the opening of a literal is not.
-  return c === '$' && dialect === 'mysql';
+  // MySQL and SQLite allow `$` inside identifiers. In Postgres `$` also may appear
+  // inside an identifier, but `$tag$` starts a dollar-quoted string — so we stop
+  // before `$` there and let the dollar-quote branch decide. Splitting an
+  // identifier is harmless; swallowing the opening of a literal is not.
+  return c === '$' && dialect !== 'postgres';
 }
 
 /**
@@ -97,12 +97,13 @@ export function lex(sql: string, dialect: Dialect): Token[] {
 
     // ---- line comment: -- ----
     // MySQL requires the `--` to be followed by whitespace or a control character,
-    // so `5--3` is arithmetic there but a comment in Postgres. This one character of
-    // difference is why the dialect has to be known before anything else happens.
+    // so `5--3` is arithmetic there but a comment in Postgres and in SQLite. This
+    // one character of difference is why the dialect has to be known before
+    // anything else happens.
     if (c === '-' && sql.charAt(i + 1) === '-') {
       const after = sql.charAt(i + 2);
       const isComment =
-        dialect === 'postgres' || after === '' || isSpace(after) || after.charCodeAt(0) < 0x20;
+        dialect !== 'mysql' || after === '' || isSpace(after) || after.charCodeAt(0) < 0x20;
       if (isComment) {
         const start = i;
         while (i < n && sql.charAt(i) !== '\n') i++;
@@ -180,21 +181,35 @@ export function lex(sql: string, dialect: Dialect): Token[] {
       continue;
     }
 
-    // ---- double quote: identifier in Postgres, string in MySQL's default sql_mode ----
+    // ---- double quote: identifier in Postgres and SQLite, string in MySQL's default sql_mode ----
     if (c === '"') {
       const start = i;
       i = scanQuoted(sql, i, '"', dialect === 'mysql', dialect);
       const body = sql.slice(start + 1, i - 1);
-      if (dialect === 'postgres') push('quotedIdent', start, i, body.replace(/""/g, '"'));
+      if (dialect !== 'mysql') push('quotedIdent', start, i, body.replace(/""/g, '"'));
       else push('string', start, i, body);
       continue;
     }
 
-    // ---- MySQL backtick identifier ----
-    if (c === '`' && dialect === 'mysql') {
+    // ---- backtick identifier (MySQL, and SQLite for MySQL compatibility) ----
+    if (c === '`' && dialect !== 'postgres') {
       const start = i;
       i = scanQuoted(sql, i, '`', false, dialect);
       push('quotedIdent', start, i, sql.slice(start + 1, i - 1).replace(/``/g, '`'));
+      continue;
+    }
+
+    // ---- SQLite bracket identifier: [x] ----
+    // SQLite accepts this for MS-Access compatibility, and it has no escape
+    // mechanism: the first `]` ends the name. Omitting it would leave our lexer
+    // reading `[users]` as punctuation around a bare word while SQLite reads one
+    // identifier — and a denylist that inspects identifiers would then not see it.
+    if (c === '[' && dialect === 'sqlite') {
+      const start = i;
+      const close = sql.indexOf(']', i + 1);
+      if (close === -1) throw new SqlLexError('unterminated [ quoted identifier', start);
+      i = close + 1;
+      push('quotedIdent', start, i, sql.slice(start + 1, close));
       continue;
     }
 

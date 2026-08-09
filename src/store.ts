@@ -209,6 +209,10 @@ export function planStoreDdl(
        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     ];
   }
+  // Postgres and SQLite differ in exactly one column: the audit table's
+  // auto-incrementing key. Everything else is text, which is the point.
+  const autoKey = dialect === 'sqlite' ? 'INTEGER PRIMARY KEY AUTOINCREMENT' : 'bigserial PRIMARY KEY';
+
   return [
     `CREATE TABLE IF NOT EXISTS "${planTable}" (
        id          text PRIMARY KEY,
@@ -222,7 +226,7 @@ export function planStoreDdl(
      )`,
     `CREATE INDEX IF NOT EXISTS ix_${planTable}_status ON "${planTable}" (status)`,
     `CREATE TABLE IF NOT EXISTS "${auditTable}" (
-       id        bigserial PRIMARY KEY,
+       id        ${autoKey},
        plan_id   text NOT NULL,
        phase     text NOT NULL,
        actor     text NOT NULL,

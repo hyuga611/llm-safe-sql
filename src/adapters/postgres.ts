@@ -40,6 +40,8 @@ const TYPES = {
 
 export class PostgresAdapter implements Adapter {
   readonly dialect = 'postgres' as const;
+  /** `statement_timeout` and `lock_timeout` are both real here, so there is nothing to disclaim. */
+  readonly limitations: readonly string[] = [];
   private readonly client: pg.Client;
   private open = false;
   private savepoints = 0;
@@ -258,6 +260,10 @@ export class PostgresAdapter implements Adapter {
 
   quoteIdent(name: string): string {
     return '"' + name.replace(/"/g, '""') + '"';
+  }
+
+  rowLockClause(): string {
+    return ' FOR UPDATE';
   }
 
   async close(): Promise<void> {

@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **SQLite, through Node's built-in `node:sqlite`.** `"dialect": "sqlite"` with
+  `"connection": { "file": "app.db" }`. No server, no container, no credential —
+  which means the claim this library makes can now be watched happening on a file
+  in a temp directory in about a minute, before anyone decides whether to trust
+  it. The whole SQLite suite runs in the ordinary `npm test`, because there is
+  nothing to start. Requires Node 24 (`node:sqlite` ships unflagged from 23.4);
+  MySQL and PostgreSQL still run on Node 20+.
+- **`Adapter.limitations`** (SPEC E5) — an adapter now declares what it cannot
+  guarantee, and the engine prints it on **every** confirmation card. SQLite has
+  no statement timeout at all, and `node:sqlite` exposes no interrupt to build
+  one from. Accepting the configured limit and quietly dropping it would have
+  been the same defect this library was extracted after, so it says so instead.
+- **`Adapter.rowLockClause()`** — SQLite has no row locks and `FOR UPDATE` does
+  not parse, so it takes the whole-database write lock up front with
+  `BEGIN IMMEDIATE` and returns an empty clause. A method rather than a constant
+  because getting it wrong is not symmetric: appending `FOR UPDATE` on SQLite
+  throws, while *omitting* it on PostgreSQL runs perfectly and silently drops the
+  guarantee the apply depends on.
+- SPEC **E6** (prove the rollback against the real database, not a scratch table
+  — `PRAGMA journal_mode = OFF` accepts a `ROLLBACK` and keeps the change) and
+  **E7** (a connection declared read-only is proven so by attempting a write,
+  because on SQLite that boundary is a file handle rather than a credential).
+
+### Fixed
+
+- **`keyOf` threw on a 64-bit integer.** Row keys were built with
+  `JSON.stringify` over the raw driver value, and `JSON.stringify` throws on a
+  `bigint` rather than degrading. MySQL and PostgreSQL both return their 64-bit
+  ids as strings, so no test had ever met a real `bigint` — SQLite returns every
+  integer as one, and the failure was immediate and total: every plan against a
+  table with an integer primary key. Values now go through the same envelope the
+  plan is stored with, so a key built from a live row and a key built from a
+  decoded snapshot are built the same way.
+- `llm-safe-sql read` crashed on any row containing a 64-bit integer, for the
+  same reason and in the same place. The CLI and the MCP server now share one
+  replacer, so the model and the human reading the same row see the same text;
+  it also summarises `Uint8Array` binary instead of printing it as a numbered
+  object.
+
 ## [0.1.1] — 2026-08-09
 
 ### Fixed

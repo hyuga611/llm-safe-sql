@@ -1,5 +1,6 @@
 import type { Dialect } from './lexer.js';
 import type { Row } from './adapter.js';
+import { encodeValue } from './serialize.js';
 
 /**
  * Addressing rows by primary key.
@@ -12,12 +13,24 @@ import type { Row } from './adapter.js';
  * invisible until it mattered.
  */
 
-/** A stable string identity for a row, used to line before/after up by key. */
+/**
+ * A stable string identity for a row, used to line before/after up by key.
+ *
+ * The value goes through {@link encodeValue} first, for two reasons. The obvious
+ * one: `JSON.stringify` throws outright on a `bigint`, and SQLite hands back
+ * every integer as one — MySQL and Postgres both return their 64-bit ids as
+ * strings, so nothing here had met a real `bigint` until a third adapter arrived.
+ *
+ * The quieter one: the same envelope is what the plan is stored with, so a key
+ * built from a live row and a key built from a decoded snapshot are built the
+ * same way. Two spellings of "the same row" would not be a crash — they would be
+ * an apply that reports the row moved when nobody had touched it.
+ */
 export function keyOf(pk: readonly string[], row: Row): string {
   // U+0000 cannot appear in the JSON encoding of a value, so it is the one
   // separator a key's own text cannot forge: without it, keys ('a','b') and
   // ('a|b') collide and two different rows are treated as one.
-  return pk.map((c) => JSON.stringify(row[c] ?? null)).join('\u0000');
+  return pk.map((c) => JSON.stringify(encodeValue(row[c] ?? null))).join('\u0000');
 }
 
 /** Placeholder syntax differs, and getting it wrong turns into string concatenation. */

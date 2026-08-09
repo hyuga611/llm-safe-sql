@@ -267,7 +267,7 @@ export class Applier {
       // which the row set can change between "which rows are these" and "are
       // they still what you saw".
       const locked = await this.adapter.query<Row>(
-        `SELECT * FROM ${qname(q, table)} WHERE ${where} FOR UPDATE`,
+        `SELECT * FROM ${qname(q, table)} WHERE ${where}${this.adapter.rowLockClause()}`,
       );
 
       const wanted = new Set(plan.rows.map((r) => keyOf(pk, r.key)));

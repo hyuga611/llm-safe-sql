@@ -2,6 +2,7 @@ import { planCard } from '../card.js';
 import { Refusal } from '../refusal.js';
 import type { ReadResult } from '../engine.js';
 import type { StoredPlan } from '../store.js';
+import { displayReplacer } from '../serialize.js';
 
 /**
  * An MCP server over stdio, written directly against the wire protocol.
@@ -236,15 +237,12 @@ function renderRead(r: ReadResult): string {
   return `${head}\n${JSON.stringify(r.rows, replacer, 2)}`;
 }
 
-/** Values a database returns are not all JSON-native; say what they are rather than dropping them. */
-function replacer(_key: string, value: unknown): unknown {
-  if (typeof value === 'bigint') return value.toString();
-  if (value !== null && typeof value === 'object' && (value as { type?: string }).type === 'Buffer') {
-    const data = (value as { data?: number[] }).data ?? [];
-    return `<${data.length} bytes of binary>`;
-  }
-  return value;
-}
+/**
+ * Values a database returns are not all JSON-native; say what they are rather
+ * than dropping them. Shared with the CLI so the model and the human reading the
+ * same row see the same text.
+ */
+const replacer = displayReplacer;
 
 /**
  * Read newline-delimited JSON-RPC from a stream and write replies to another.

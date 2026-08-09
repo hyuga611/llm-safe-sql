@@ -6,3 +6,6 @@ dist/
 # Local configuration: it names your tables and may point at a real database.
 llm-safe-sql.config.json
 *.local.json
+
+# Build artefacts from `npm pack`, which is run by hand while testing an install.
+*.tgz

@@ -1,6 +1,25 @@
 import type { Dialect } from './lexer.js';
 
 /**
+ * The environment cannot support the guarantees this library makes.
+ *
+ * It lives here, in the module that has no driver imports, rather than beside
+ * any one adapter. It used to be defined in the MySQL adapter and imported by
+ * the others — which quietly meant that loading the **Postgres** adapter loaded
+ * `mysql2`, so a Postgres-only installation could not connect at all. The error
+ * it produced named the wrong package (`The pg driver is not installed`, with
+ * `pg` installed), sending the reader to reinstall something that was already
+ * there. A shared error type is not worth an import edge between two adapters
+ * that must never load together.
+ */
+export class AdapterUnusable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AdapterUnusable';
+  }
+}
+
+/**
  * What llm-safe-sql needs from a database driver.
  *
  * Everything here exists because the engine's central claim — "we really ran your

@@ -1,6 +1,6 @@
 import pg from 'pg';
 import type { Adapter, ColumnShape, Row, Savepoint, TableShape } from '../adapter.js';
-import { AdapterUnusable } from './mysql.js';
+import { AdapterUnusable } from '../adapter.js';
 
 export { AdapterUnusable };
 

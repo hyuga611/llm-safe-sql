@@ -254,10 +254,34 @@ export async function connectAdapter(dialect: Dialect, conn: ConnectionConfig): 
     return await PostgresAdapter.connect(conn);
   } catch (e) {
     if (e instanceof ConfigError) throw e;
-    const driver = dialect === 'mysql' ? 'mysql2' : 'pg';
-    if (String(e).includes('ERR_MODULE_NOT_FOUND') || String(e).includes(`Cannot find package '${driver}'`)) {
-      throw new ConfigError(`The ${driver} driver is not installed. Run: npm install ${driver}`);
+    const missing = missingPackage(e);
+    if (missing !== undefined) {
+      throw new ConfigError(`The ${missing} driver is not installed. Run: npm install ${missing}`);
     }
     throw e;
   }
+}
+
+/**
+ * The package Node could not find, taken from the error rather than guessed.
+ *
+ * This used to infer the name from the dialect — `mysql` meant `mysql2`, and
+ * anything else meant `pg` — which is right only while the guess and the reality
+ * agree. They stopped agreeing when the Postgres adapter imported a shared error
+ * class from the MySQL adapter: loading Postgres then loaded `mysql2`, and a
+ * Postgres-only install was told *"The pg driver is not installed"* with `pg`
+ * sitting in `node_modules`. Reading the name out of the error cannot drift from
+ * what actually failed, and if the specifier is unrecognisable the original
+ * error is rethrown rather than replaced with a confident wrong one.
+ */
+function missingPackage(e: unknown): string | undefined {
+  const msg = String((e as { message?: unknown })?.message ?? e);
+  if (!msg.includes('ERR_MODULE_NOT_FOUND') && !msg.includes('Cannot find package')) return undefined;
+  const named = /Cannot find package '([^']+)'/.exec(msg) ?? /Cannot find module '([^']+)'/.exec(msg);
+  const spec = named?.[1];
+  if (spec === undefined) return undefined;
+  // Only report a bare package name. A relative specifier means one of our own
+  // files is missing, which is a broken install, not a driver the user forgot.
+  if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('file:')) return undefined;
+  return spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : (spec.split('/')[0] as string);
 }

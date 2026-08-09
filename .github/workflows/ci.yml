@@ -178,3 +178,30 @@ jobs:
               .then((m) => console.log('root import works without mysql2:', Object.keys(m).length, 'exports'))
               .catch((e) => { console.error(e); process.exit(1); });
           "
+
+      # Importing the root is not enough, and believing it was is how this got
+      # shipped: the root deliberately does not load any adapter, so it stayed
+      # green while `connectAdapter('postgres', …)` was completely broken without
+      # mysql2 — the Postgres adapter imported a shared error class from the
+      # MySQL one. The reported error even named the wrong package. So actually
+      # connect, to a port with nothing on it, and require the failure to be a
+      # connection failure rather than a missing driver.
+      - name: Connecting to Postgres must not need mysql2
+        working-directory: /tmp/consumer
+        run: |
+          node --input-type=module -e "
+            const { connectAdapter } = await import('@hyuga/llm-safe-sql');
+            try {
+              await connectAdapter('postgres', {
+                host: '127.0.0.1', port: 1, user: 'x', password: '', database: 'y',
+              });
+              console.error('expected a connection failure on port 1');
+              process.exit(1);
+            } catch (e) {
+              console.log('got:', e.code ?? '(no code)', '-', e.message.slice(0, 80));
+              if (/driver is not installed/.test(e.message)) {
+                console.error('the Postgres path is pulling in another driver');
+                process.exit(1);
+              }
+            }
+          "

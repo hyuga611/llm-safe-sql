@@ -1,5 +1,5 @@
 import mysql from 'mysql2/promise';
-import type { Adapter, ColumnShape, Row, Savepoint, TableShape } from '../adapter.js';
+import type { Adapter, ColumnShape, Row, Savepoint, SelfCheckMode, TableShape } from '../adapter.js';
 import { AdapterUnusable } from '../adapter.js';
 
 export { AdapterUnusable };
@@ -281,6 +281,17 @@ export class MysqlAdapter implements Adapter {
 
   quoteIdent(name: string): string {
     return '`' + name.replace(/`/g, '``') + '`';
+  }
+
+  /** Attempt a write, then undo it. See the Postgres adapter for why it is a temporary table. */
+  async probeWritable(): Promise<boolean> {
+    try {
+      await this.conn.query('CREATE TEMPORARY TABLE llm_safe_sql_wprobe (id INT)');
+      await this.conn.query('DROP TEMPORARY TABLE IF EXISTS llm_safe_sql_wprobe');
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   rowLockClause(): string {

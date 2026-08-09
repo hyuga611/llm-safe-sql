@@ -193,7 +193,7 @@ async function run(args: Args): Promise<number> {
       return withSession(cfg, async (s) => {
         await s.engine.adapter.selfCheck();
         await s.applier.adapter.selfCheck();
-        if (s.engine.readIsSeparate) await s.engine.readAdapter.selfCheck();
+        if (s.engine.readIsSeparate) await s.engine.readAdapter.selfCheck('read');
         out(`Connections are usable (${cfg.dialect}).`);
         out('  the session is not shared with another caller');
         out('  a rollback really undoes a write');
@@ -228,6 +228,14 @@ async function run(args: Args): Promise<number> {
             'read uses the SAME credential as plan, so reads run on a connection that can write. The ' +
               'allowlist is then the only thing standing between a read tool and a write — and it runs in ' +
               'this process. Point readConnection at a role with no write privileges.',
+          );
+        } else if (await s.engine.readAdapter.probeWritable()) {
+          // Configuring a different role and configuring a role that cannot
+          // write are separate facts, and only the second one is a boundary.
+          warn.push(
+            'readConnection is a different credential, but it CAN write — probed, not assumed. The ' +
+              'separation is nominal: nothing below this library is stopping a read path from writing. ' +
+              'Revoke INSERT/UPDATE/DELETE from that role.',
           );
         }
         if (idOf(cfg.storeConnection ?? cfg.connection) === idOf(cfg.applyConnection ?? cfg.connection)) {

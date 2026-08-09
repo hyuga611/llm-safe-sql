@@ -1,4 +1,4 @@
-import type { Adapter, ColumnShape, InboundCascade, Row, Savepoint, TableShape } from '../adapter.js';
+import type { Adapter, ColumnShape, InboundCascade, Row, Savepoint, SelfCheckMode, TableShape } from '../adapter.js';
 import { AdapterUnusable } from '../adapter.js';
 
 export { AdapterUnusable };
@@ -140,7 +140,7 @@ export class SqliteAdapter implements Adapter {
     return this.readOnly;
   }
 
-  async selfCheck(): Promise<void> {
+  async selfCheck(_mode: SelfCheckMode = 'full'): Promise<void> {
     // A read-only handle is the recommended shape for the model side, so this is
     // not an error — but the flag is checked rather than believed. If a handle we
     // were told is read-only turns out to accept a write, the separation the
@@ -414,6 +414,25 @@ export class SqliteAdapter implements Adapter {
    * {@link begin} opening with `BEGIN IMMEDIATE`, which holds the whole database
    * against other writers for the life of the transaction.
    */
+  /** SQLite answers this without a probe: a read-only handle refuses every write. */
+  async probeWritable(): Promise<boolean> {
+    if (this.readOnly) return false;
+    try {
+      this.db.exec('BEGIN IMMEDIATE');
+      this.db.exec('CREATE TABLE llm_safe_sql_wprobe (id INTEGER)');
+      return true;
+    } catch {
+      return false;
+    } finally {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* nothing to undo */
+      }
+      this.open = false;
+    }
+  }
+
   rowLockClause(): string {
     return '';
   }

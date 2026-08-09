@@ -1,6 +1,6 @@
 import type { Adapter } from './adapter.js';
 import { Applier } from './apply.js';
-import { connectAdapter, policyOf, type Config } from './config.js';
+import { connectAdapter, connectionIdentity, policyOf, type Config } from './config.js';
 import { Engine } from './engine.js';
 import type { Policy } from './policy.js';
 import { SqlPlanStore } from './store.js';
@@ -60,10 +60,14 @@ export async function openReadSession(cfg: Config): Promise<ReadSession> {
   try {
     bookkeeping = await connectAdapter(cfg.dialect, cfg.storeConnection ?? cfg.connection);
     opened.push(bookkeeping);
-    // Only a separate connection when one was actually configured. Opening a
-    // second session with the same credential would look like a boundary in the
-    // process list and be none, which is worse than not having it.
-    if (cfg.readConnection !== undefined) {
+    // A separate connection only when the credential actually differs. Opening a
+    // second session with the same identity would look like a boundary in the
+    // process list and be none — and `Engine.readIsSeparate` would then report a
+    // separation that does not exist, which is worse than not having one.
+    if (
+      cfg.readConnection !== undefined &&
+      connectionIdentity(cfg.readConnection) !== connectionIdentity(cfg.connection)
+    ) {
       reading = await connectAdapter(cfg.dialect, cfg.readConnection);
       opened.push(reading);
     }

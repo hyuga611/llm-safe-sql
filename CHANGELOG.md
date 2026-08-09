@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-08-09
+
+### Fixed
+
+- **`readConnection` did not work on PostgreSQL with an actual read-only role** —
+  which is the configuration 0.3.0 shipped documentation recommending. `read()`
+  ran the *write* path's environment check against it, and that check creates a
+  temporary table, so a role correctly denied that privilege was rejected with
+  "Cannot create a temporary table, so the environment cannot be verified." A
+  guard written for one role, applied to another, refusing the correct setup.
+  `selfCheck` now takes a mode, and the read path asks only for what reading
+  depends on.
+- **`Engine.readIsSeparate` reported a separation that did not exist.** It
+  compared adapter object identity, and a `readConnection` block with the same
+  credentials as `connection` still produced a second object. A session now opens
+  a separate read connection only when the credential actually differs.
+- `check` no longer takes "you configured a different role" as evidence of
+  anything. It calls the new `Adapter.probeWritable()` — an attempted write,
+  rolled back — and says so when a `readConnection` is a distinct credential that
+  can still write. Configuring a different role and configuring a role that
+  cannot write are separate facts, and only the second one is a boundary.
+
 ## [0.3.0] — 2026-08-09
 
 ### Added
@@ -206,6 +228,7 @@ produced a plan describing something other than what would happen:
 - No runtime dependencies. Drivers are optional peers; the MCP server implements
   the wire protocol directly.
 
+[0.3.1]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.3.1
 [0.3.0]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.3.0
 [0.2.0]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.2.0
 [0.1.1]: https://github.com/hyuga611/llm-safe-sql/releases/tag/v0.1.1

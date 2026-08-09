@@ -81,7 +81,17 @@ export interface Adapter {
    *   runtime happened to close connections at process exit — an accident, not a
    *   design.
    */
-  selfCheck(): Promise<void>;
+  selfCheck(mode?: SelfCheckMode): Promise<void>;
+
+  /**
+   * Can this connection actually write? Probed, not assumed, and harmlessly.
+   *
+   * `check` uses it to tell an operator whether a connection they configured as
+   * the read path is really constrained, because "I pointed readConnection at a
+   * different role" and "that role cannot write" are separate facts and only the
+   * second one is a boundary. Implementations must leave nothing behind.
+   */
+  probeWritable(): Promise<boolean>;
 
   /**
    * Bound this session in time, for the dry run *and* for the real apply.
@@ -190,6 +200,21 @@ export interface Adapter {
 
   close(): Promise<void>;
 }
+
+/**
+ * Which guarantees a connection is being asked to prove.
+ *
+ * `'full'` is the write path: a real transaction, a rollback that undoes, and a
+ * counting model the reconciliation can rely on. Establishing those requires
+ * writing, so they cannot be asked of a read-only role.
+ *
+ * `'read'` is the read path. It must prove only what reading depends on. This
+ * distinction exists because the first version of the read connection ran the
+ * full check against it, which failed on exactly the configuration the docs
+ * recommend — a Postgres role with no privilege to create a temporary table.
+ * A guard written for one role, applied to another, refusing the correct setup.
+ */
+export type SelfCheckMode = 'full' | 'read';
 
 export interface Savepoint {
   readonly name: string;

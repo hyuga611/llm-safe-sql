@@ -1,5 +1,5 @@
 import pg from 'pg';
-import type { Adapter, ColumnShape, Row, Savepoint, TableShape } from '../adapter.js';
+import type { Adapter, ColumnShape, Row, Savepoint, SelfCheckMode, TableShape } from '../adapter.js';
 import { AdapterUnusable } from '../adapter.js';
 
 export { AdapterUnusable };
@@ -56,9 +56,10 @@ export class PostgresAdapter implements Adapter {
     return new PostgresAdapter(client);
   }
 
-  async selfCheck(): Promise<void> {
+  async selfCheck(mode: SelfCheckMode = 'full'): Promise<void> {
     // 1. Session stickiness. pgbouncer in transaction mode will fail this, and it
-    //    must: it can hand our session to another caller mid-dry-run.
+    //    must: it can hand our session to another caller mid-dry-run. This one
+    //    applies to reads too — a truncated read is still a wrong answer.
     await this.client.query("SET llm_safe_sql.probe = 'sticky'");
     const stick = await this.client.query<{ v: string }>("SELECT current_setting('llm_safe_sql.probe', true) AS v");
     if (stick.rows[0]?.v !== 'sticky') {
@@ -67,6 +68,11 @@ export class PostgresAdapter implements Adapter {
           'cannot be used: a dry run could be left open on a connection handed to another caller.',
       );
     }
+
+    // Everything below needs write privileges to establish, so it cannot be
+    // asked of the read path — a read-only role has no business creating a
+    // temporary table, and demanding one refuses the correct configuration.
+    if (mode === 'read') return;
 
     try {
       await this.client.query('CREATE TEMP TABLE llm_safe_sql_probe (id INT PRIMARY KEY, v INT NOT NULL)');
@@ -260,6 +266,24 @@ export class PostgresAdapter implements Adapter {
 
   quoteIdent(name: string): string {
     return '"' + name.replace(/"/g, '""') + '"';
+  }
+
+  /**
+   * Attempt a write inside a transaction that is always rolled back.
+   *
+   * A temporary table rather than a real one: a role that can write to the
+   * schema but not create tables would otherwise read as read-only.
+   */
+  async probeWritable(): Promise<boolean> {
+    try {
+      await this.client.query('BEGIN');
+      await this.client.query('CREATE TEMP TABLE llm_safe_sql_wprobe (id INT)');
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await this.client.query('ROLLBACK').catch(() => {});
+    }
   }
 
   rowLockClause(): string {

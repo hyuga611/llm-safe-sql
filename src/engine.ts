@@ -362,7 +362,10 @@ export class Engine {
       throw new PlanRefused('ADAPTER_UNUSABLE', `This connection will not be used again: ${this.poisoned}`);
     }
     if (!this.readChecked) {
-      await this.readAdapter.selfCheck();
+      // A separate read connection is verified as a read connection. Asking it
+      // for the write path's guarantees would refuse the very configuration this
+      // setting exists to encourage: a role with no privilege to write.
+      await this.readAdapter.selfCheck(this.readIsSeparate ? 'read' : 'full');
       this.readChecked = true;
     }
 

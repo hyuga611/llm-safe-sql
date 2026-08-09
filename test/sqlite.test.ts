@@ -383,4 +383,25 @@ describe('sqlite', { skip }, () => {
     assert.equal(e.readIsSeparate, false);
     assert.equal(e.readAdapter, e.adapter);
   });
+
+  test('read: a read-only connection is verified as a read connection, not as a write one', async () => {
+    const ro = await SqliteAdapter.connect({ file, readOnly: true });
+    try {
+      // The write path's guarantees cannot be established without writing. Asking
+      // for them here refused the exact configuration the docs recommend — a
+      // Postgres role with no privilege to create a temporary table.
+      await ro.selfCheck('read');
+      assert.equal(await ro.probeWritable(), false);
+    } finally {
+      await ro.close();
+    }
+  });
+
+  test('probeWritable says yes for a writable connection, and leaves nothing behind', async () => {
+    assert.equal(await planning.probeWritable(), true);
+    const left = await bookkeeping.query<Row>(
+      "SELECT name FROM sqlite_master WHERE name = 'llm_safe_sql_wprobe'",
+    );
+    assert.equal(left.length, 0, 'the write probe must be rolled back');
+  });
 });

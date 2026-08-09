@@ -50,23 +50,38 @@ function storeOf(cfg: Config, adapter: Adapter): SqlPlanStore {
  */
 export async function openReadSession(cfg: Config): Promise<ReadSession> {
   const planning = await connectAdapter(cfg.dialect, cfg.connection);
+  const opened: Adapter[] = [planning];
+  const closeAll = async (): Promise<void> => {
+    for (const a of opened) await a.close().catch(() => {});
+  };
+
   let bookkeeping: Adapter;
+  let reading: Adapter | undefined;
   try {
     bookkeeping = await connectAdapter(cfg.dialect, cfg.storeConnection ?? cfg.connection);
+    opened.push(bookkeeping);
+    // Only a separate connection when one was actually configured. Opening a
+    // second session with the same credential would look like a boundary in the
+    // process list and be none, which is worse than not having it.
+    if (cfg.readConnection !== undefined) {
+      reading = await connectAdapter(cfg.dialect, cfg.readConnection);
+      opened.push(reading);
+    }
   } catch (e) {
-    await planning.close().catch(() => {});
+    await closeAll();
     throw e;
   }
+
   const policy = policyOf(cfg);
   return {
     cfg,
     policy,
-    engine: new Engine(engineOptions(cfg, planning, policy)),
+    engine: new Engine({
+      ...engineOptions(cfg, planning, policy),
+      ...(reading === undefined ? {} : { readAdapter: reading }),
+    }),
     store: storeOf(cfg, bookkeeping),
-    async close() {
-      await planning.close().catch(() => {});
-      await bookkeeping.close().catch(() => {});
-    },
+    close: closeAll,
   };
 }
 

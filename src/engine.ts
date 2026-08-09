@@ -90,6 +90,23 @@ export interface ReadResult {
 
 export interface EngineOptions {
   readonly adapter: Adapter;
+  /**
+   * A separate connection for {@link Engine.read}, ideally one the database
+   * itself will not let write. Defaults to {@link adapter}.
+   *
+   * The dry run cannot use it: planning means really executing the statement
+   * before rolling it back, so that connection must be able to write. Reading
+   * has no such excuse, and reading is the larger surface — it is what an
+   * injected instruction reaches first, and exfiltration needs no write at all.
+   *
+   * This exists because of where the other guards sit. The allowlist and the
+   * denied-identifier check run inside this process, holding a credential that
+   * can write; they are only as good as this library is correct. A connection
+   * the engine refuses to let write is enforced a layer below us, and survives
+   * our own bugs. On SQLite that is a read-only handle SQLite enforces itself;
+   * elsewhere it is a database role with no write privileges.
+   */
+  readonly readAdapter?: Adapter;
   readonly policy: Policy;
   readonly limits?: {
     readonly maxUpdateRows?: number;
@@ -126,21 +143,30 @@ const DEFAULTS = { maxUpdateRows: 200, maxDeleteRows: 50, maxReadRows: 200, stat
 
 export class Engine {
   readonly adapter: Adapter;
+  /** Where reads go. The same object as {@link adapter} unless one was supplied. */
+  readonly readAdapter: Adapter;
+  /** True when reads and dry runs are the same connection, and so the same privileges. */
+  readonly readIsSeparate: boolean;
   private readonly policy: Policy;
   private readonly limits: Required<NonNullable<EngineOptions['limits']>>;
   private readonly declaredAuto: Readonly<Record<string, readonly string[]>>;
   private readonly rollbackHook: (() => Promise<void>) | undefined;
   private checked: boolean;
+  /** The read connection is verified separately, because it may be a different connection. */
+  private readChecked: boolean;
   /** Set when the connection's state is no longer known. Nothing may run after that. */
   private poisoned: string | undefined;
 
   constructor(opts: EngineOptions) {
     this.adapter = opts.adapter;
+    this.readAdapter = opts.readAdapter ?? opts.adapter;
+    this.readIsSeparate = this.readAdapter !== this.adapter;
     this.policy = opts.policy;
     this.limits = { ...DEFAULTS, ...(opts.limits ?? {}) };
     this.declaredAuto = opts.autoColumns ?? {};
     this.rollbackHook = opts._rollbackHook;
     this.checked = opts.assumeChecked ?? false;
+    this.readChecked = opts.assumeChecked ?? false;
   }
 
   /**
@@ -335,14 +361,14 @@ export class Engine {
     if (this.poisoned !== undefined) {
       throw new PlanRefused('ADAPTER_UNUSABLE', `This connection will not be used again: ${this.poisoned}`);
     }
-    if (!this.checked) {
-      await this.adapter.selfCheck();
-      this.checked = true;
+    if (!this.readChecked) {
+      await this.readAdapter.selfCheck();
+      this.readChecked = true;
     }
 
     let stmt;
     try {
-      stmt = normalize(rawSql, { dialect: this.adapter.dialect });
+      stmt = normalize(rawSql, { dialect: this.readAdapter.dialect });
       this.policy.check(stmt);
     } catch (e) {
       if (e instanceof Rejected || e instanceof PolicyViolation) throw new PlanRefused(e.code, e.message);
@@ -361,13 +387,13 @@ export class Engine {
     }
 
     const limit = Math.max(1, Math.floor(opts.limit ?? this.limits.maxReadRows));
-    await this.adapter.applyLimits({ statementMs: this.limits.statementMs, lockMs: this.limits.lockMs });
+    await this.readAdapter.applyLimits({ statementMs: this.limits.statementMs, lockMs: this.limits.lockMs });
 
     // R4 — ask for one more row than we will show. Fetching exactly the limit
     // makes "was there more?" unanswerable, and the caller is then told it saw
     // everything. Wrapping rather than appending keeps a LIMIT the statement
     // already had, instead of producing two of them.
-    const rows = await this.adapter.query<Row>(
+    const rows = await this.readAdapter.query<Row>(
       `SELECT * FROM (${stmt.sql}) AS llm_safe_sql_read LIMIT ${limit + 1}`,
     );
     const truncated = rows.length > limit;

@@ -170,3 +170,31 @@ test('ping is answered', async () => {
   const res = await serverWith().handle({ jsonrpc: '2.0', id: 3, method: 'ping' });
   assert.deepEqual(res?.result, {});
 });
+
+// =====================================================================
+//  Tool annotations.
+//
+//   These are how a client decides whether to show a confirmation dialog. They
+//   are assertions a server makes about itself, so they are worth getting right
+//   rather than optimistic: sql_plan really executes the statement before
+//   rolling it back, and claiming readOnlyHint for it would be the convenient
+//   answer rather than the true one.
+// =====================================================================
+test('every tool declares annotations, and only the genuinely read-only ones claim it', async () => {
+  const res = await serverWith().handle({ jsonrpc: '2.0', id: 9, method: 'tools/list' });
+  const tools = (res?.result as { tools: { name: string; annotations?: Record<string, unknown> }[] }).tools;
+
+  for (const t of tools) {
+    assert.ok(t.annotations !== undefined, `${t.name} has no annotations`);
+    assert.equal(t.annotations?.['destructiveHint'], false, `${t.name} should never be destructive`);
+  }
+
+  const byName = new Map(tools.map((t) => [t.name, t.annotations ?? {}]));
+  assert.equal(byName.get('sql_read')?.['readOnlyHint'], true);
+  assert.equal(byName.get('sql_plan_status')?.['readOnlyHint'], true);
+  assert.equal(byName.get('sql_schema')?.['readOnlyHint'], true);
+
+  // The one that matters: a dry run writes and then takes it back. No net
+  // change is not the same as no change, so it must not claim read-only.
+  assert.equal(byName.get('sql_plan')?.['readOnlyHint'], false);
+});

@@ -54,6 +54,21 @@ export function isSqliteConnection(c: ConnectionConfig): c is SqliteConnectionCo
   return typeof (c as SqliteConnectionConfig).file === 'string';
 }
 
+/**
+ * How this connection would appear to the database, with no secret in it.
+ *
+ * Used to answer one question the operator cannot otherwise check: are the
+ * connections this deployment separates actually different credentials? Two
+ * config blocks that differ only in whitespace look like a boundary in the
+ * config file and are none, and nothing else in the system will ever say so.
+ * The password is deliberately not part of it — two entries with the same user
+ * and different passwords are the same identity to the database's audit log.
+ */
+export function connectionIdentity(c: ConnectionConfig): string {
+  if (isSqliteConnection(c)) return `file:${c.file}${c.readOnly === true ? ' (read-only)' : ''}`;
+  return `${c.user}@${c.host}:${String(c.port)}/${c.database}`;
+}
+
 export interface LimitsConfig {
   readonly maxUpdateRows?: number;
   readonly maxDeleteRows?: number;
@@ -76,6 +91,20 @@ export interface Config {
   readonly applyConnection?: ConnectionConfig;
   /** Where plans and audit records live. Defaults to `connection`. Must not be the apply connection's session. */
   readonly storeConnection?: ConnectionConfig;
+  /**
+   * The connection used for reads. Defaults to `connection`.
+   *
+   * Point it at a role the database will not let write, and the read path stops
+   * depending on this library being correct. That matters more than it sounds:
+   * the allowlist and the secret-column check run in this process holding a
+   * credential that can write, so they are guards a bug can get past. A role
+   * without write privileges is enforced by the database, below us.
+   *
+   * The dry run deliberately cannot use this connection — planning executes the
+   * statement for real before rolling it back — which is why it is a separate
+   * setting rather than a flag on `connection`.
+   */
+  readonly readConnection?: ConnectionConfig;
   readonly policy: PolicyOptions;
   readonly limits?: LimitsConfig;
   readonly autoColumns?: Readonly<Record<string, readonly string[]>>;
@@ -198,6 +227,9 @@ export function parseConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env):
     ...(cfg['storeConnection'] === undefined
       ? {}
       : { storeConnection: connectionOf(cfg['storeConnection'], 'config.storeConnection', dialect) }),
+    ...(cfg['readConnection'] === undefined
+      ? {}
+      : { readConnection: connectionOf(cfg['readConnection'], 'config.readConnection', dialect) }),
     policy,
     ...(cfg['limits'] === undefined ? {} : { limits: cfg['limits'] as LimitsConfig }),
     ...(cfg['autoColumns'] === undefined

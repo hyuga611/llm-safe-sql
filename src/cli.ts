@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline/promises';
 import { planCard } from './card.js';
-import { loadConfig, type Config } from './config.js';
+import { connectionIdentity, loadConfig, type Config, type ConnectionConfig } from './config.js';
 import { Refusal } from './refusal.js';
 import { openAdminSession, type AdminSession } from './session.js';
 import { recordPlan, type PlanStatus } from './store.js';
@@ -52,6 +52,8 @@ const TEMPLATE = `{
     "password": "\${LLM_SAFE_SQL_PASSWORD}",
     "database": "app"
   },
+
+  "//readConnection": "Optional, and the cheapest real win here. Point it at a role with NO write privileges. Reads then stop depending on this library being correct — the allowlist runs in this process holding a credential that can write; a role without the privilege is enforced by the database itself. The dry run cannot use it, because planning really executes the statement before rolling it back.",
 
   "//applyConnection": "Optional. Point this at a DIFFERENT database user, one the model's tools cannot reach. Then the separation between proposing and committing does not depend on this library being free of bugs.",
 
@@ -191,10 +193,55 @@ async function run(args: Args): Promise<number> {
       return withSession(cfg, async (s) => {
         await s.engine.adapter.selfCheck();
         await s.applier.adapter.selfCheck();
+        if (s.engine.readIsSeparate) await s.engine.readAdapter.selfCheck();
         out(`Connections are usable (${cfg.dialect}).`);
         out('  the session is not shared with another caller');
         out('  a rollback really undoes a write');
         out('  "rows affected" means what this library assumes');
+        for (const w of s.engine.adapter.limitations) out(`  NOT enforced here: ${w}`);
+
+        // Which guards are enforced by the database, and which only by this
+        // process. Everything else this command prints is about whether the
+        // library works; this is about whether it matters if it doesn't.
+        out('');
+        out('Where the guards actually sit');
+        const roles: { name: string; conn: ConnectionConfig; note: string }[] = [
+          { name: 'read ', conn: cfg.readConnection ?? cfg.connection, note: 'the model reads through this' },
+          { name: 'plan ', conn: cfg.connection, note: 'writes for real, always rolls back' },
+          { name: 'apply', conn: cfg.applyConnection ?? cfg.connection, note: 'this one commits' },
+          { name: 'store', conn: cfg.storeConnection ?? cfg.connection, note: 'plans and audit records' },
+        ];
+        for (const r of roles) out(`  ${r.name}  ${connectionIdentity(r.conn)}  — ${r.note}`);
+
+        const idOf = (c: ConnectionConfig): string => connectionIdentity(c);
+        const plan = idOf(cfg.connection);
+        const warn: string[] = [];
+        if (idOf(cfg.applyConnection ?? cfg.connection) === plan) {
+          warn.push(
+            'apply uses the SAME credential as plan. The separation between proposing and committing then ' +
+              'rests entirely on this library being correct. Point applyConnection at a different database ' +
+              'user and it survives a bug in here.',
+          );
+        }
+        if (idOf(cfg.readConnection ?? cfg.connection) === plan) {
+          warn.push(
+            'read uses the SAME credential as plan, so reads run on a connection that can write. The ' +
+              'allowlist is then the only thing standing between a read tool and a write — and it runs in ' +
+              'this process. Point readConnection at a role with no write privileges.',
+          );
+        }
+        if (idOf(cfg.storeConnection ?? cfg.connection) === idOf(cfg.applyConnection ?? cfg.connection)) {
+          warn.push(
+            'store uses the same credential as apply, so whatever can commit a change can also edit the ' +
+              'record of it having been approved.',
+          );
+        }
+        for (const w of warn) {
+          out('');
+          out(`  ! ${w}`);
+        }
+        if (warn.length === 0) out('  every role is a distinct credential.');
+        out('');
         for (const table of cfg.policy.allow) {
           const shape = await s.engine.adapter.introspect(table);
           const notes: string[] = [];

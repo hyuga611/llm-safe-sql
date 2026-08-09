@@ -342,4 +342,45 @@ describe('sqlite', { skip }, () => {
       (e: unknown) => e instanceof ConfigError && /file/i.test((e as Error).message),
     );
   });
+
+  // =====================================================================
+  //  The read path can be enforced below this library.
+  // =====================================================================
+
+  test('read: a separate read-only connection serves reads and refuses writes', async () => {
+    const ro = await SqliteAdapter.connect({ file, readOnly: true });
+    const e = new Engine({ adapter: planning, readAdapter: ro, policy });
+    try {
+      assert.equal(e.readIsSeparate, true);
+
+      const r = await e.read('SELECT id, qty FROM orders WHERE id = 1');
+      assert.equal(r.rows.length, 1);
+      assert.equal(Number(r.rows[0]?.['qty']), 10);
+
+      // The guarantee is not that we refuse — it is that SQLite refuses, one
+      // layer below anything this library gets right or wrong.
+      await assert.rejects(() => ro.query("UPDATE orders SET qty = 999 WHERE id = 1"));
+      assert.equal(await qtyOf(1), 10);
+    } finally {
+      await ro.close();
+    }
+  });
+
+  test('read: planning still works while reads are read-only, because it needs its own connection', async () => {
+    const ro = await SqliteAdapter.connect({ file, readOnly: true });
+    const e = new Engine({ adapter: planning, readAdapter: ro, policy });
+    try {
+      const plan = await e.plan('UPDATE orders SET qty = qty + 5 WHERE id = 1');
+      assert.equal(plan.rows.length, 1);
+      assert.equal(await qtyOf(1), 10, 'the dry run must still roll back');
+    } finally {
+      await ro.close();
+    }
+  });
+
+  test('read: with no readAdapter, reads share the connection that can write', async () => {
+    const e = new Engine({ adapter: planning, policy });
+    assert.equal(e.readIsSeparate, false);
+    assert.equal(e.readAdapter, e.adapter);
+  });
 });

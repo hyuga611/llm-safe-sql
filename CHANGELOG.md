@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`readConnection`** — a separate connection for reads, ideally a role the
+  database will not let write (SPEC E9). The dry run genuinely cannot use it,
+  since planning executes the statement for real before rolling it back; nothing
+  else needs the privilege. Reading is the larger surface anyway — it is what an
+  injected instruction reaches first, and exfiltration needs no write at all.
+  Until now the allowlist was the only thing between a read tool and a write, and
+  it runs in this process holding a credential that can write.
+- **`check` now prints where each guard is actually enforced** (SPEC E8), and
+  names the ones that are fictional:
+
+  ```text
+  Where the guards actually sit
+    read   app_ro@db:5432/app   — the model reads through this
+    plan   app@db:5432/app      — writes for real, always rolls back
+    apply  app@db:5432/app      — this one commits
+    store  app@db:5432/app      — plans and audit records
+
+    ! apply uses the SAME credential as plan. The separation between proposing
+      and committing then rests entirely on this library being correct.
+    ! store uses the same credential as apply, so whatever can commit a change
+      can also edit the record of it having been approved.
+  ```
+
+  A guard inside this process is only as good as this code is correct; a
+  database role without the privilege survives our bugs. Both are worth having.
+  Conflating them is how an operator comes to believe in a boundary that is one
+  `if` statement in a library they have never read.
+- **MCP tool annotations** on all four tools, so a client can decide how to
+  render approval. `sql_plan` is deliberately **not** marked `readOnlyHint`: the
+  database ends the call unchanged, but planning really executes the statement,
+  takes locks and fires triggers, and a trigger can reach outside the
+  transaction. "No net change" is not "does not modify its environment", and
+  this is not the library to round that off in its own favour.
+- `check` also lists whatever the adapter cannot enforce, so SQLite's missing
+  statement timeout appears there as well as on every card.
+
 ## [0.2.0] — 2026-08-09
 
 ### Added

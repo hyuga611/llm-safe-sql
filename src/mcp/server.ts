@@ -55,6 +55,17 @@ export interface McpTools {
 const TOOLS = [
   {
     name: 'sql_read',
+    // Declared so a client can render this as the low-risk call it is. These are
+    // hints a server asserts about itself, not a gate — a hostile server can
+    // claim readOnlyHint on a DELETE and suppress the confirmation dialog. They
+    // are worth stating accurately for exactly that reason.
+    annotations: {
+      title: 'Read from the database',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       'Run a read-only SELECT against the configured database and return the rows. ' +
       'Only tables the operator has allowlisted are readable, and columns marked as secrets are refused ' +
@@ -72,6 +83,20 @@ const TOOLS = [
   },
   {
     name: 'sql_plan',
+    // NOT readOnlyHint. The database ends the call byte-for-byte as it started,
+    // and it would be convenient to claim that — but planning really executes
+    // the statement before rolling it back. It takes locks, it fires triggers,
+    // and a trigger can reach outside the transaction. "No net change" is not
+    // "does not modify its environment", and this is not the library to round
+    // that off in its own favour. destructiveHint is false because the rollback
+    // is unconditional: nothing here survives the call.
+    annotations: {
+      title: 'Propose a change (measured, then rolled back)',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     description:
       'Propose an UPDATE or DELETE. This does NOT change anything. The statement is executed inside a ' +
       'transaction, the real before/after values are measured, and the transaction is always rolled back — ' +
@@ -96,6 +121,13 @@ const TOOLS = [
   },
   {
     name: 'sql_plan_status',
+    annotations: {
+      title: 'Look up a plan',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       'Look up a plan by id: whether a person has approved it, applied it, or cancelled it. ' +
       'Use this instead of assuming a plan went through.',
@@ -108,6 +140,13 @@ const TOOLS = [
   },
   {
     name: 'sql_schema',
+    annotations: {
+      title: 'List the reachable tables',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       'List the tables this deployment may touch, what changing each one means, and their columns. ' +
       'Read this before writing a statement rather than guessing column names.',

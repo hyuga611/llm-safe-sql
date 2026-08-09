@@ -253,6 +253,46 @@ wolf is a safety check somebody eventually switches off.
 - **Protect you from a compromised applier.** The apply path holds a credential
   that can write. Point it at a different database user from the planning one.
 
+## Where the guard is enforced
+
+Most of what this library does runs *inside this process*, holding a credential
+that can write. The allowlist, the denied columns, the row ceilings — all of them
+are guards a bug in here can get past. That is worth saying out loud, because the
+alternative is an operator believing in a boundary that turns out to be one `if`
+statement in a library they have never read.
+
+So `llm-safe-sql check` prints where each guard actually sits:
+
+```text
+Where the guards actually sit
+  read   app_ro@db:5432/app   — the model reads through this
+  plan   app@db:5432/app      — writes for real, always rolls back
+  apply  app@db:5432/app      — this one commits
+  store  app@db:5432/app      — plans and audit records
+
+  ! apply uses the SAME credential as plan. The separation between proposing and
+    committing then rests entirely on this library being correct.
+```
+
+Four connections can be configured, and each one you actually separate moves a
+guarantee below this code, where it survives our mistakes:
+
+| | what it is for | if you leave it at the default |
+|---|---|---|
+| `connection` | the dry run — must be able to write | — |
+| `applyConnection` | commits approved plans | the credential the model's tools reach is the one that commits |
+| `readConnection` | reads | reads run on a connection that can write, and the allowlist is the only thing stopping them |
+| `storeConnection` | plans and audit records | whatever can commit a change can also edit the record of its approval |
+
+`readConnection` is the cheapest real win: point it at a role with no write
+privileges. Reading is the larger surface — it is what an injected instruction
+reaches first, and exfiltration needs no write at all. The dry run genuinely
+cannot use such a connection, which is why it is a separate setting.
+
+None of this makes the in-process guards pointless. They catch the ordinary
+mistakes, and they produce the explanations. But when the two disagree, the
+database wins, and it should.
+
 ## Measured, not assumed
 
 Facts marked 🔬 in [SPEC.md](SPEC.md) were established by measuring MySQL 8.4.11

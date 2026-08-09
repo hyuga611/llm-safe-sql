@@ -269,10 +269,19 @@ Where the guards actually sit
   plan   app@db:5432/app      — writes for real, always rolls back
   apply  app@db:5432/app      — this one commits
   store  app@db:5432/app      — plans and audit records
+  + read is a credential the database itself refuses writes from — probed on your own tables.
 
   ! apply uses the SAME credential as plan. The separation between proposing and
     committing then rests entirely on this library being correct.
 ```
+
+That `+` line is the only one that reports on the database rather than on your
+config file, so it is the only one that costs anything to produce. `check`
+attempts a real `DELETE ... WHERE 1 = 0` and `UPDATE ... SET c = c WHERE 1 = 0`
+on your allowlisted tables, inside a transaction it rolls back — the privilege is
+checked before a row is matched, so nothing is touched. If it cannot establish
+the answer it says so in those words; it never reports "constrained" by staying
+quiet.
 
 Four connections can be configured, and each one you actually separate moves a
 guarantee below this code, where it survives our mistakes:
@@ -283,6 +292,14 @@ guarantee below this code, where it survives our mistakes:
 | `applyConnection` | commits approved plans | the credential the model's tools reach is the one that commits |
 | `readConnection` | reads | reads run on a connection that can write, and the allowlist is the only thing stopping them |
 | `storeConnection` | plans and audit records | whatever can commit a change can also edit the record of its approval |
+
+On PostgreSQL each of these also carries a `schema`, defaulting to `public`, and
+it is pinned on the connection rather than inherited. PostgreSQL's own default is
+`"$user", public`, which resolves differently for every role — so separating the
+plan and apply roles, which is the whole point of the table above, is what makes
+`orders` able to mean two different tables. Set `schema` if your tables do not
+live in `public`; get it wrong and you are told the relation does not exist,
+rather than writing to the wrong one.
 
 `readConnection` is the cheapest real win: point it at a role with no write
 privileges. Reading is the larger surface — it is what an injected instruction

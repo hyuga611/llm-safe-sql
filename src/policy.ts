@@ -1,5 +1,5 @@
 import type { NormalizeResult } from './normalize.js';
-import { tableRefs, setColumns, lower } from './statement.js';
+import { tableRefs, setColumns, setColumnsAreCertain, lower } from './statement.js';
 import { Refusal } from './refusal.js';
 
 export type PolicyCode =
@@ -138,6 +138,18 @@ export class Policy {
     }
 
     // 4. Columns that must go through a purpose-built operation instead.
+    if (this.denyWriteCol.size > 0 && !setColumnsAreCertain(tokens)) {
+      // An assignment whose target could not be read is not an assignment to
+      // nothing. Passing it would make this guard silently conditional on the
+      // parser understanding every spelling of a SET clause — which is how two
+      // of them got through before: `SET t.col = …` reported the table as the
+      // column, and Postgres' `SET (a, b) = (…)` reported only the first name.
+      throw new PolicyViolation(
+        'DENIED_WRITE_COLUMN',
+        'Part of this SET clause could not be read as a column assignment, and columns are denied here. ' +
+          'Rewrite it as plain `column = value` assignments so the guard can see what is being written.',
+      );
+    }
     for (const col of setColumns(tokens)) {
       const why = this.denyWriteCol.get(lower(col));
       if (why !== undefined) {

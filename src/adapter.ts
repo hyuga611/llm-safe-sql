@@ -1,4 +1,5 @@
 import type { Dialect } from './lexer.js';
+import { Refusal } from './refusal.js';
 
 /**
  * The environment cannot support the guarantees this library makes.
@@ -12,9 +13,17 @@ import type { Dialect } from './lexer.js';
  * there. A shared error type is not worth an import edge between two adapters
  * that must never load together.
  */
-export class AdapterUnusable extends Error {
+export class AdapterUnusable extends Refusal {
+  declare readonly code: 'ADAPTER_UNUSABLE';
   constructor(message: string) {
-    super(message);
+    // A `Refusal`, because that is what it is. It used to extend `Error`
+    // directly, while SPEC's appendix said every deliberate "no" in this library
+    // is a `Refusal` carrying a `code` — and this class is the source of most of
+    // the conditions the engine reports as `ADAPTER_UNUSABLE`. A caller
+    // following that documentation and catching `Refusal` therefore caught every
+    // refusal except the one that means "the environment cannot support the
+    // guarantees", which escaped as an unhandled rejection.
+    super('ADAPTER_UNUSABLE', message);
     this.name = 'AdapterUnusable';
   }
 }
@@ -84,14 +93,32 @@ export interface Adapter {
   selfCheck(mode?: SelfCheckMode): Promise<void>;
 
   /**
-   * Can this connection actually write? Probed, not assumed, and harmlessly.
+   * Will the database let this connection change these tables? Probed, not
+   * assumed, and without touching a row.
    *
    * `check` uses it to tell an operator whether a connection they configured as
    * the read path is really constrained, because "I pointed readConnection at a
    * different role" and "that role cannot write" are separate facts and only the
-   * second one is a boundary. Implementations must leave nothing behind.
+   * second one is a boundary.
+   *
+   * The first version of this asked a different question: it created a temporary
+   * table and reported success as "writable". That is not the same privilege. On
+   * MySQL `CREATE TEMPORARY TABLES` is granted separately from DML, so the
+   * ordinary application account produced by `GRANT SELECT, INSERT, UPDATE,
+   * DELETE` failed the probe and was reported as *unable to write* — measured, on
+   * MySQL 8.4 and PostgreSQL 16, while it was updating a row. `check` then said
+   * nothing at all, and "nothing at all" is how it says a configuration is sound.
+   * A false negative here is the worst output this library can produce: it tells
+   * an operator a boundary exists below the code when there is none.
+   *
+   * So implementations must ask the real question — attempt the writes this
+   * library can actually emit — and must distinguish "proved it cannot" from
+   * "could not tell". See {@link probeWriteAbility}, which does the reasoning;
+   * an adapter only supplies the isolation its engine needs.
+   *
+   * @param tables the allowlisted tables. Nothing outside them is ever touched.
    */
-  probeWritable(): Promise<boolean>;
+  probeWritable(tables: readonly string[]): Promise<WriteAbility>;
 
   /**
    * Bound this session in time, for the dry run *and* for the real apply.
@@ -215,6 +242,73 @@ export interface Adapter {
  * A guard written for one role, applied to another, refusing the correct setup.
  */
 export type SelfCheckMode = 'full' | 'read';
+
+/**
+ * What the database will let a connection do — as established, not as configured.
+ *
+ * `'unknown'` is deliberately not a synonym for `'read-only'`. They differ in the
+ * direction that matters: reporting "read-only" when nothing was established
+ * hands an operator a boundary that may not exist, and `check` is the one place
+ * they go to find out. Anything that cannot prove `'read-only'` must say so.
+ */
+export type WriteAbility = 'writable' | 'read-only' | 'unknown';
+
+/**
+ * The reasoning behind {@link Adapter.probeWritable}, shared by every adapter so
+ * that no engine can quietly answer a different question from the others. That
+ * has already happened once here — `selfCheck`'s mode was honoured on two engines
+ * and ignored on the third — and it is invisible to the type checker.
+ *
+ * Adapters supply `attempt`, which must run one statement and report only whether
+ * the database accepted it, leaving the session no worse off either way. The
+ * isolation that requires is engine-specific: PostgreSQL aborts the entire
+ * transaction on the first error, so without a savepoint per attempt every probe
+ * after a refusal reports `current transaction is aborted` — which reads exactly
+ * like a refusal, and would have reported a role holding UPDATE as read-only.
+ *
+ * `WHERE 1 = 0` is what keeps this harmless: both engines check the privilege
+ * while preparing the statement, before any row is matched. Measured on MySQL 8.4
+ * and PostgreSQL 16 — a denied role is denied, a permitted role succeeds, and the
+ * table still holds every row afterwards.
+ */
+export async function probeWriteAbility(
+  tables: readonly string[],
+  columnsOf: (table: string) => Promise<readonly string[]>,
+  quote: (name: string) => string,
+  attempt: (sql: string) => Promise<boolean>,
+): Promise<WriteAbility> {
+  let anyReadable = false;
+
+  for (const table of tables) {
+    const name = quote(table);
+    // A table this connection cannot even read says nothing about whether it can
+    // write. Skipping it is the difference between "proved read-only" and "asked
+    // the wrong table".
+    if (!(await attempt(`SELECT 1 FROM ${name} WHERE 1 = 0`))) continue;
+    anyReadable = true;
+
+    // DELETE first, because it names no column and so cannot fail for any reason
+    // except the privilege.
+    if (await attempt(`DELETE FROM ${name} WHERE 1 = 0`)) return 'writable';
+
+    // A role may hold UPDATE and not DELETE. `SET c = c` is type-correct for any
+    // column, but a generated column rejects being assigned at all, so a single
+    // candidate could fail for a reason that has nothing to do with privileges.
+    // Trying each column in turn removes that gap rather than disclaiming it.
+    let columns: readonly string[] = [];
+    try {
+      columns = await columnsOf(table);
+    } catch {
+      columns = [];
+    }
+    for (const c of columns) {
+      const col = quote(c);
+      if (await attempt(`UPDATE ${name} SET ${col} = ${col} WHERE 1 = 0`)) return 'writable';
+    }
+  }
+
+  return anyReadable ? 'read-only' : 'unknown';
+}
 
 export interface Savepoint {
   readonly name: string;

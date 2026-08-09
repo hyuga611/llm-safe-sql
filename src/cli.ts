@@ -194,6 +194,12 @@ async function run(args: Args): Promise<number> {
         await s.engine.adapter.selfCheck();
         await s.applier.adapter.selfCheck();
         if (s.engine.readIsSeparate) await s.engine.readAdapter.selfCheck('read');
+        // The store connection too. It was the one role `check` listed and never
+        // verified, while the line below says "Connections are usable" in the
+        // plural — and this is the connection the record of an approval lives on,
+        // so an environment that cannot keep it is the environment where the
+        // audit trail quietly is not one.
+        await s.store.adapter.selfCheck();
         out(`Connections are usable (${cfg.dialect}).`);
         out('  the session is not shared with another caller');
         out('  a rollback really undoes a write');
@@ -216,6 +222,8 @@ async function run(args: Args): Promise<number> {
         const idOf = (c: ConnectionConfig): string => connectionIdentity(c);
         const plan = idOf(cfg.connection);
         const warn: string[] = [];
+        /** Facts established by asking the database, not by reading the config. */
+        const proved: string[] = [];
         if (idOf(cfg.applyConnection ?? cfg.connection) === plan) {
           warn.push(
             'apply uses the SAME credential as plan. The separation between proposing and committing then ' +
@@ -229,25 +237,55 @@ async function run(args: Args): Promise<number> {
               'allowlist is then the only thing standing between a read tool and a write — and it runs in ' +
               'this process. Point readConnection at a role with no write privileges.',
           );
-        } else if (await s.engine.readAdapter.probeWritable()) {
+        } else {
           // Configuring a different role and configuring a role that cannot
           // write are separate facts, and only the second one is a boundary.
-          warn.push(
-            'readConnection is a different credential, but it CAN write — probed, not assumed. The ' +
-              'separation is nominal: nothing below this library is stopping a read path from writing. ' +
-              'Revoke INSERT/UPDATE/DELETE from that role.',
-          );
+          const ability = await s.engine.readAdapter.probeWritable(cfg.policy.allow);
+          if (ability === 'writable') {
+            warn.push(
+              'readConnection is a different credential, but it CAN write — probed, not assumed. The ' +
+                'separation is nominal: nothing below this library is stopping a read path from writing. ' +
+                'Revoke INSERT/UPDATE/DELETE from that role.',
+            );
+          } else if (ability === 'unknown') {
+            // Silence used to mean "proved read-only". It must not: the earlier
+            // probe answered a different question and reported an ordinary
+            // read-write account as constrained, which is this command telling
+            // an operator a boundary exists when it does not.
+            warn.push(
+              'readConnection is a different credential, but whether the database will let it write could ' +
+                'not be established — none of the allowlisted tables were readable on it, so there was ' +
+                'nothing to ask about. Treat the separation as unproven until you check the grants by hand.',
+            );
+          } else {
+            proved.push('read is a credential the database itself refuses writes from — probed on your own tables.');
+          }
         }
-        if (idOf(cfg.storeConnection ?? cfg.connection) === idOf(cfg.applyConnection ?? cfg.connection)) {
+        const store = idOf(cfg.storeConnection ?? cfg.connection);
+        if (store === idOf(cfg.applyConnection ?? cfg.connection)) {
           warn.push(
             'store uses the same credential as apply, so whatever can commit a change can also edit the ' +
               'record of it having been approved.',
           );
+        } else if (store === plan) {
+          // Checked separately, because it used not to be checked at all: with
+          // `storeConnection` left at the default and a distinct
+          // `applyConnection`, the test above passes and this command printed
+          // "every role is a distinct credential" about a configuration in which
+          // two of them are the same one.
+          warn.push(
+            'store uses the same credential as plan, so the side that proposes a change can also edit the ' +
+              'stored plan it will later be checked against.',
+          );
         }
+        for (const p of proved) out(`  + ${p}`);
         for (const w of warn) {
           out('');
           out(`  ! ${w}`);
         }
+        // "Distinct credential" is all this line ever meant, and it is worth
+        // saying no more than that: distinct is a fact about the config file,
+        // while the lines above are facts about what the database will refuse.
         if (warn.length === 0) out('  every role is a distinct credential.');
         out('');
         for (const table of cfg.policy.allow) {
@@ -356,7 +394,12 @@ async function run(args: Args): Promise<number> {
         const res = await s.applier.apply(id, actor);
         out(`Applied: ${res.op} on ${res.table}, ${res.rowsAffected} row(s), at ${res.appliedAt}.`);
         for (const w of res.warnings) out(`WARNING: ${w}`);
-        return res.warnings.length === 0 ? 0 : 1;
+        // Zero, because the change is committed. This used to exit 1 whenever the
+        // apply produced a warning, which told every script and CI step that the
+        // write had failed when it had succeeded — and the obvious response to a
+        // failed apply is to run it again. A warning is something to read, not a
+        // different outcome; the outcome is that the database changed.
+        return 0;
       });
     }
 

@@ -344,3 +344,43 @@ test('mysql: a zero date is shown as what is stored, not as 1899-11-30', async (
   assert.equal(String(rows[0]?.d), '0000-00-00');
   await my.query('DROP TABLE IF EXISTS zerodate');
 });
+
+test('P7: a misspelled SET column is refused before anything runs', async () => {
+  // SPEC has carried this rule since the first version with nothing implementing
+  // it, so the misspelling was found by the database — after the trial statement
+  // had already executed inside the dry run — and reached the operator as a raw
+  // driver error rather than as a refusal naming the columns the table has.
+  const r = await refused(myE.plan('UPDATE parents SET vv = 1 WHERE id = 1'));
+  assert.equal(r.code, 'NO_SUCH_COLUMN');
+  assert.match(r.message, /\bv\b/, 'it should say what the table does have');
+
+  const p = await refused(pgE.plan('UPDATE precise SET nope = 1 WHERE id = 1'));
+  assert.equal(p.code, 'NO_SUCH_COLUMN');
+});
+
+test('denyWriteColumns is not escaped by a table-qualified or multi-column SET', async () => {
+  // Both spellings were legal SQL that wrote the denied column while the guard
+  // reported nothing: `SET t.col = …` handed the *table* name to the check, and
+  // Postgres' `SET (a, b) = (…)` reported only the first name in the list.
+  const guarded = new Policy({
+    allow: ['parents', 'precise'],
+    impact: { parents: 'test table', precise: 'test table' },
+    denyWriteColumns: { v: 'a protected column' },
+  });
+  const my2 = new Engine({ adapter: my, policy: guarded, limits: { maxUpdateRows: 5, maxDeleteRows: 5 } });
+  const a = await refused(my2.plan('UPDATE parents SET parents.v = 9 WHERE id = 1'));
+  assert.equal(a.code, 'DENIED_WRITE_COLUMN');
+
+  const pgGuarded = new Policy({
+    allow: ['pgpair'],
+    impact: { pgpair: 'test table' },
+    denyWriteColumns: { v: 'a protected column' },
+  });
+  await pgA.query('DROP TABLE IF EXISTS pgpair');
+  await pgA.query('CREATE TABLE pgpair (id INT PRIMARY KEY, n INT NOT NULL, v INT NOT NULL)');
+  await pgA.query('INSERT INTO pgpair VALUES (1, 1, 1)');
+  const pg2 = new Engine({ adapter: pgA, policy: pgGuarded, limits: { maxUpdateRows: 5, maxDeleteRows: 5 } });
+  const b = await refused(pg2.plan('UPDATE pgpair SET (n, v) = (2, 2) WHERE id = 1'));
+  assert.equal(b.code, 'DENIED_WRITE_COLUMN');
+  await pgA.query('DROP TABLE IF EXISTS pgpair');
+});

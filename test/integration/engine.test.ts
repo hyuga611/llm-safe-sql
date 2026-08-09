@@ -169,6 +169,30 @@ test('D6 MySQL: a dry run may not nest inside a caller transaction', async () =>
   }
 });
 
+test('D6 MySQL: two overlapping dry runs cannot commit one another', async () => {
+  // The worst outcome this library can have, and it needed no concurrency in the
+  // caller to reach — the MCP server serves tool calls as they arrive on one
+  // session. The nesting check asks "is a transaction open?" several awaits
+  // before the begin() it guards, so two overlapping calls both saw no and both
+  // opened one. On MySQL, START TRANSACTION on a connection that already has one
+  // open **commits** it: the first dry run becomes a permanent write to
+  // production, and is reported to the operator as rolled back.
+  const settled = await Promise.allSettled([
+    myEngine.plan("UPDATE orders SET qty = 91 WHERE ref = 'R-1'"),
+    myEngine.plan("UPDATE orders SET qty = 92 WHERE ref = 'R-2'"),
+  ]);
+  const refused = settled.filter((s) => s.status === 'rejected').map((s) => s.reason as PlanRefused);
+  assert.equal(refused.length, 1, 'exactly one may hold the connection');
+  assert.equal(refused[0]?.code, 'BUSY');
+
+  const live = await my.query<{ ref: string; qty: number }>('SELECT ref, qty FROM orders ORDER BY id');
+  assert.deepEqual(
+    live.map((r) => Number(r.qty)),
+    [10, 20, 30],
+    'neither trial may survive in production',
+  );
+});
+
 test('D8 Postgres: an undeclared trigger-maintained column refuses rather than guesses', async () => {
   const r = await refusal(pgEngine.plan('UPDATE trig SET v = 9 WHERE id = 1'));
   assert.equal(r.code, 'AUTO_COLUMNS_UNKNOWN');

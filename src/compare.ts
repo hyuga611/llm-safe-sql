@@ -85,10 +85,21 @@ export function sameValue(a: unknown, b: unknown): boolean {
     return ta !== undefined && tb !== undefined && ta === tb;
   }
 
-  // A number and its textual form. Only when the string really is numeric —
-  // otherwise `0` would equal `"abc"` through Number() coercion.
-  const aNum = numericish(a);
-  const bNum = numericish(b);
+  // A number and its textual form — and only *across* types, which is what the
+  // tolerance was ever for: drivers disagree about whether DECIMAL and BIGINT
+  // arrive as `10` or as `"10.00"`.
+  //
+  // Applying it between two strings was a silent data-loss bug. Both sides of a
+  // diff come from the same driver and the same column, so two strings are two
+  // spellings the database is storing verbatim: `'00100'` and `'100'` are
+  // different postcodes, different SKUs, different account numbers. `sameValue`
+  // called them equal, so the column was dropped from `changed` — and from the
+  // card, from the digest, and from the pre-apply comparison. An UPDATE that set
+  // a name *and* a zero-padded code was approved as "1 column: name" and
+  // committed both. Measured end to end before this line was written.
+  const bothStrings = typeof a === 'string' && typeof b === 'string';
+  const aNum = bothStrings ? undefined : numericish(a);
+  const bNum = bothStrings ? undefined : numericish(b);
   if (aNum !== undefined && bNum !== undefined) return aNum === bNum;
   if (aNum !== undefined || bNum !== undefined) return false;
 

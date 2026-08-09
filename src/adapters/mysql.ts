@@ -1,6 +1,6 @@
 import mysql from 'mysql2/promise';
-import type { Adapter, ColumnShape, Row, Savepoint, SelfCheckMode, TableShape } from '../adapter.js';
-import { AdapterUnusable } from '../adapter.js';
+import type { Adapter, ColumnShape, Row, Savepoint, SelfCheckMode, TableShape, WriteAbility } from '../adapter.js';
+import { AdapterUnusable, probeWriteAbility } from '../adapter.js';
 
 export { AdapterUnusable };
 
@@ -14,8 +14,25 @@ export interface MysqlConfig {
 
 export class MysqlAdapter implements Adapter {
   readonly dialect = 'mysql' as const;
-  /** `max_execution_time` and `innodb_lock_wait_timeout` are both real here, so there is nothing to disclaim. */
-  readonly limitations: readonly string[] = [];
+  /**
+   * This used to read "both are real here, so there is nothing to disclaim",
+   * which was wrong in the way that matters: `max_execution_time` is real, and it
+   * applies to read-only `SELECT` only. MySQL has no statement timeout for an
+   * UPDATE or a DELETE at all — measured, and pinned by
+   * `test/integration/adapters.test.ts`, in this repository, while this array
+   * stayed empty. So the engine copied nothing onto the card, `check` printed
+   * nothing, and `limits.statementMs` looked enforced on the one engine where the
+   * write it is meant to bound is not bounded by it.
+   *
+   * SQLite declares the same gap and always has. An adapter that cannot do
+   * something and says so is a known trade; the same adapter saying nothing is
+   * the ambush E5 exists to prevent.
+   */
+  readonly limitations: readonly string[] = [
+    'MySQL cannot bound how long an UPDATE or DELETE runs: max_execution_time applies to read-only ' +
+      'SELECT only, so the statement time limit does not constrain a write here. What does constrain ' +
+      'one is innodb_lock_wait_timeout plus the row ceiling, so neither is optional on MySQL.',
+  ];
   private readonly conn: mysql.Connection;
   private open = false;
   private savepoints = 0;
@@ -49,6 +66,35 @@ export class MysqlAdapter implements Adapter {
       // database does not contain being shown to somebody for approval.
       dateStrings: true,
     });
+
+    // Make the server agree with the parser about what the text means.
+    //
+    // The lexer reads MySQL with the server's defaults: `"x"` is a *string*, and
+    // a backslash escapes inside one. Two sql_mode flags change that, and both
+    // are ordinary things to find on a real server:
+    //
+    //   ANSI_QUOTES          `"api_token"` becomes an identifier. The lexer sees
+    //                        a string, so it is not an identifier reference —
+    //                        and `denyIdentifiers`, which is the rule that stops
+    //                        a credential column being read, never fires while
+    //                        MySQL happily returns the column.
+    //   NO_BACKSLASH_ESCAPES a backslash stops escaping, so the lexer and the
+    //                        server disagree about where a string literal ends,
+    //                        which is a disagreement about how many statements
+    //                        there are.
+    //
+    // Cleared per session rather than probed-and-refused: a server default of
+    // ANSI_QUOTES is somebody's whole application, and refusing to run at all
+    // would be a worse answer than making our own session unambiguous. Built
+    // from the current value so nothing else — STRICT_TRANS_TABLES above all —
+    // is dropped on the way. selfCheck then proves it took.
+    const [modeRows] = await conn.query<mysql.RowDataPacket[]>('SELECT @@SESSION.sql_mode AS m');
+    const modes = String(modeRows[0]?.['m'] ?? '')
+      .split(',')
+      .map((m) => m.trim())
+      .filter((m) => m !== '' && m !== 'ANSI_QUOTES' && m !== 'NO_BACKSLASH_ESCAPES' && m !== 'ANSI');
+    await conn.query('SET SESSION sql_mode = ?', [modes.join(',')]);
+
     return new MysqlAdapter(conn);
   }
 
@@ -56,10 +102,11 @@ export class MysqlAdapter implements Adapter {
    * Prove the four things this library's guarantees rest on, using a TEMPORARY
    * table so no user data is touched.
    */
-  async selfCheck(): Promise<void> {
+  async selfCheck(mode: SelfCheckMode = 'full'): Promise<void> {
     // 1. Is the session sticky? A transaction-pooling proxy can hand our session
     //    to somebody else between statements, which would leave an open dry-run
-    //    transaction — and its locks — in a stranger's hands.
+    //    transaction — and its locks — in a stranger's hands. True of reads too:
+    //    a read served from someone else's session is still a wrong answer.
     await this.conn.query("SET @llm_safe_sql_probe = 'sticky'");
     const [stick] = await this.conn.query<mysql.RowDataPacket[]>('SELECT @llm_safe_sql_probe AS v');
     if (stick[0]?.['v'] !== 'sticky') {
@@ -68,6 +115,28 @@ export class MysqlAdapter implements Adapter {
           'cannot be used: a dry run could be left open on a connection handed to another caller.',
       );
     }
+
+    // 1b. The parser and the server still read the same text the same way. This
+    //     is checked on the read path too: the identifier rule that keeps a
+    //     credential column from being read is the one ANSI_QUOTES defeats, and
+    //     reads are what an injected instruction reaches first.
+    const [modeRows] = await this.conn.query<mysql.RowDataPacket[]>('SELECT @@SESSION.sql_mode AS m');
+    const active = String(modeRows[0]?.['m'] ?? '').split(',');
+    for (const bad of ['ANSI_QUOTES', 'NO_BACKSLASH_ESCAPES', 'ANSI']) {
+      if (active.includes(bad)) {
+        throw new AdapterUnusable(
+          `This session still has sql_mode ${bad}, which changes what the text of a statement means — ` +
+            'so the parser in this library and the server would disagree about which parts are identifiers ' +
+            'and where a string ends. It is cleared when the connection is opened, so something reset it ' +
+            '(a proxy, or a connection handed over between statements).',
+        );
+      }
+    }
+
+    // Everything below needs CREATE TEMPORARY TABLES and the privilege to write.
+    // The read path has neither, by design, and demanding them of it refuses the
+    // configuration this setting exists to encourage.
+    if (mode === 'read') return;
 
     let probe: mysql.RowDataPacket[];
     try {
@@ -283,14 +352,36 @@ export class MysqlAdapter implements Adapter {
     return '`' + name.replace(/`/g, '``') + '`';
   }
 
-  /** Attempt a write, then undo it. See the Postgres adapter for why it is a temporary table. */
-  async probeWritable(): Promise<boolean> {
+  /**
+   * Ask MySQL whether this account may change the allowlisted tables.
+   *
+   * No savepoints here, unlike Postgres: MySQL leaves a transaction usable after
+   * a statement is refused, so each attempt already starts from a clean session.
+   * The surrounding transaction is belt and braces — `WHERE 1 = 0` matches
+   * nothing, so there is nothing to undo, and the rollback is there in case a
+   * future MySQL disagrees with that.
+   */
+  async probeWritable(tables: readonly string[]): Promise<WriteAbility> {
+    // Never inside a caller's transaction: the rollback below would discard
+    // their work. Nothing was established, so say exactly that.
+    if (this.inTransaction()) return 'unknown';
+    await this.conn.query('START TRANSACTION');
     try {
-      await this.conn.query('CREATE TEMPORARY TABLE llm_safe_sql_wprobe (id INT)');
-      await this.conn.query('DROP TEMPORARY TABLE IF EXISTS llm_safe_sql_wprobe');
-      return true;
-    } catch {
-      return false;
+      return await probeWriteAbility(
+        tables,
+        async (t) => (await this.introspect(t)).columns.map((c) => c.name),
+        (n) => this.quoteIdent(n),
+        async (sql) => {
+          try {
+            await this.conn.query(sql);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+      );
+    } finally {
+      await this.conn.query('ROLLBACK').catch(() => {});
     }
   }
 

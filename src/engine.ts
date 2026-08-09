@@ -1,5 +1,5 @@
 import { normalize, Rejected } from './normalize.js';
-import { tableRefs, whereClause, lower } from './statement.js';
+import { tableRefs, setColumns, whereClause, lower } from './statement.js';
 import { PolicyViolation, type Policy } from './policy.js';
 import type { Adapter, Row, TableShape } from './adapter.js';
 import { sameValue as same } from './compare.js';
@@ -31,6 +31,8 @@ export type RefusalCode =
   | 'NO_CHANGE'
   | 'ROW_COUNT_MISMATCH'
   | 'ROLLBACK_FAILED'
+  | 'BUSY'
+  | 'NO_SUCH_COLUMN'
   | 'NOT_TRANSACTIONAL'
   | 'CASCADE_SIDE_EFFECTS'
   | 'ADAPTER_UNUSABLE';
@@ -156,6 +158,13 @@ export class Engine {
   private readChecked: boolean;
   /** Set when the connection's state is no longer known. Nothing may run after that. */
   private poisoned: string | undefined;
+  /**
+   * What currently owns the planning connection, if anything.
+   *
+   * Read and written only between `await`s, so it is a lock in the only sense
+   * this runtime has one. See {@link plan}.
+   */
+  private busy: string | undefined;
 
   constructor(opts: EngineOptions) {
     this.adapter = opts.adapter;
@@ -177,8 +186,39 @@ export class Engine {
    * correct. `SET price = price * 1.1` is an expression; triggers fire; defaults
    * apply. Anything short of executing it is a guess, and showing a human a guess
    * labelled as fact is worse than showing them nothing.
+   *
+   * One at a time, per connection. The D6 check below asks the adapter whether a
+   * transaction is already open, and that question is only meaningful for a
+   * transaction somebody *else* opened: it is several `await`s away from the
+   * `begin()` it guards, so two overlapping calls both saw "no transaction" and
+   * both opened one. On MySQL the second `START TRANSACTION` **commits** the
+   * first — a dry run, permanently written to production and reported as rolled
+   * back. The MCP server makes this reachable without any concurrency in the
+   * caller: it serves tool calls as they arrive on one shared session.
+   *
+   * The latch is taken before the first `await`, which is what makes it a latch —
+   * a single-threaded runtime cannot interleave two calls until one of them
+   * yields. It refuses rather than queues, because a caller who is told "later"
+   * can decide what to do, and a caller silently held behind a lock of unknown
+   * duration cannot.
    */
   async plan(rawSql: string): Promise<Plan> {
+    if (this.busy !== undefined) {
+      throw new PlanRefused(
+        'BUSY',
+        `${this.busy} is already running on this connection, and a dry run has to own the transaction it ` +
+          'rolls back. Run one at a time, or give each caller its own session.',
+      );
+    }
+    this.busy = 'A dry run';
+    try {
+      return await this.planExclusive(rawSql);
+    } finally {
+      this.busy = undefined;
+    }
+  }
+
+  private async planExclusive(rawSql: string): Promise<Plan> {
     if (this.poisoned !== undefined) {
       throw new PlanRefused(
         'ADAPTER_UNUSABLE',
@@ -221,6 +261,24 @@ export class Engine {
         'NO_PRIMARY_KEY',
         `Table \`${table}\` has no primary key, so rows cannot be shown to you one by one.`,
       );
+    }
+
+    // P7 — every column on the left of SET has to exist. The rule was in SPEC
+    // from the first version and implemented in none of them, so a misspelling
+    // was found by the database, after the statement had been executed inside the
+    // dry run, and surfaced as a raw driver error rather than as a refusal.
+    // Checking it here costs one comparison against metadata already fetched, and
+    // it fails before anything runs.
+    if (op === 'UPDATE') {
+      const known = new Set(shape.columns.map((c) => lower(c.name)));
+      const unknown = setColumns(stmt.tokens).filter((c) => !known.has(lower(c)));
+      if (unknown.length > 0) {
+        throw new PlanRefused(
+          'NO_SUCH_COLUMN',
+          `Table \`${table}\` has no column ${unknown.map((c) => `\`${c}\``).join(', ')}. ` +
+            `It has: ${shape.columns.map((c) => c.name).join(', ')}.`,
+        );
+      }
     }
 
     // A dry run on a table that cannot roll back is not a dry run. The storage
@@ -361,6 +419,19 @@ export class Engine {
     if (this.poisoned !== undefined) {
       throw new PlanRefused('ADAPTER_UNUSABLE', `This connection will not be used again: ${this.poisoned}`);
     }
+    // A read on the connection a dry run is currently holding would be served
+    // from inside that transaction, and would report the trial's uncommitted
+    // values as the contents of the database. The card would then be confirmed by
+    // a "current state" that only exists because we are pretending. With a
+    // separate read connection there is nothing to collide with, which is one
+    // more reason to configure one.
+    if (this.busy !== undefined && !this.readIsSeparate) {
+      throw new PlanRefused(
+        'BUSY',
+        `${this.busy} is holding this connection, so a read now would return its uncommitted trial values ` +
+          'as fact. Configure readConnection so reads have a connection of their own, or read afterwards.',
+      );
+    }
     if (!this.readChecked) {
       // A separate read connection is verified as a read connection. Asking it
       // for the write path's guarantees would refuse the very configuration this
@@ -386,6 +457,20 @@ export class Engine {
         'NOT_A_READ',
         `Only SELECT and WITH are allowed here. \`${lead.toUpperCase()}\` names no table for the allowlist to ` +
           'check, so it would report on tables that were never opened up.',
+      );
+    }
+
+    // R2 — the allowlist can only bite on a table that is named. A `SELECT` with
+    // no `FROM` names none, so it went past a default-deny policy without ever
+    // being compared to it: `SELECT 1`, `SELECT DATABASE()`, and — until the
+    // forbidden list grew — `SELECT nextval('order_id_seq')`, which permanently
+    // consumes an id and is not undone by a rollback. Requiring a table makes
+    // "deny by default" true of reads in the same way it is true of writes.
+    if (tableRefs(stmt.tokens).length === 0) {
+      throw new PlanRefused(
+        'TABLE_NOT_ALLOWED',
+        'This read names no table, so there is nothing for the allowlist to check and it cannot be ' +
+          'allowed by default. Read from one of the allowlisted tables.',
       );
     }
 

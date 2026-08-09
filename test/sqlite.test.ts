@@ -129,12 +129,52 @@ describe('sqlite', { skip }, () => {
   test('E: a read-only connection can read, and is proven to be read-only', async () => {
     const ro = await SqliteAdapter.connect({ file, readOnly: true });
     try {
-      await ro.selfCheck(); // must NOT throw: this is the recommended model-side shape
+      // 'read' is the mode this connection exists for, and it must not throw:
+      // this is the recommended model-side shape.
+      await ro.selfCheck('read');
       const rows = await ro.query<Row>('SELECT qty FROM orders WHERE id = 1');
       assert.equal(Number(rows[0]?.['qty']), 10);
       assert.equal(ro.isReadOnly, true);
     } finally {
       await ro.close();
+    }
+  });
+
+  test('E: the write path cannot be verified on a read-only connection, and says so', async () => {
+    // This assertion used to be `await ro.selfCheck()` with a comment saying it
+    // must not throw. It did not throw, because the mode was ignored entirely —
+    // so the suite recorded, as intended behaviour, a connection passing the
+    // write path's check without establishing one thing the write path needs.
+    // `check` then printed "a rollback really undoes a write" about it.
+    const ro = await SqliteAdapter.connect({ file, readOnly: true });
+    try {
+      await assert.rejects(
+        () => ro.selfCheck('full'),
+        (e: unknown) => e instanceof AdapterUnusable && /read-only/i.test((e as Error).message),
+      );
+    } finally {
+      await ro.close();
+    }
+  });
+
+  test('E: a writable connection used for reads is not put through the write probe', async () => {
+    // `readConnection` need not be a read-only handle, and when it is not, the
+    // read path must still ask only for what reading depends on. The full probe
+    // opens BEGIN IMMEDIATE, which takes the whole database against other
+    // writers — so this used to make an ordinary read fail with "database is
+    // locked" whenever anything else was mid-write.
+    const other = await SqliteAdapter.connect({ file });
+    const reader = await SqliteAdapter.connect({ file });
+    try {
+      await other.begin();
+      await other.query('UPDATE orders SET qty = qty WHERE id = 1');
+      await reader.selfCheck('read'); // must not need the write lock `other` holds
+      const rows = await reader.query<Row>('SELECT qty FROM orders WHERE id = 1');
+      assert.equal(Number(rows[0]?.['qty']), 10);
+    } finally {
+      await other.rollback().catch(() => {});
+      await other.close();
+      await reader.close();
     }
   });
 
@@ -391,17 +431,107 @@ describe('sqlite', { skip }, () => {
       // for them here refused the exact configuration the docs recommend — a
       // Postgres role with no privilege to create a temporary table.
       await ro.selfCheck('read');
-      assert.equal(await ro.probeWritable(), false);
+      // Proved, not read off the flag we opened the handle with.
+      assert.equal(await ro.probeWritable(['orders']), 'read-only');
     } finally {
       await ro.close();
     }
   });
 
-  test('probeWritable says yes for a writable connection, and leaves nothing behind', async () => {
-    assert.equal(await planning.probeWritable(), true);
+  test('probeWritable says yes for a writable connection, and changes nothing', async () => {
+    const before = await bookkeeping.query<Row>('SELECT * FROM orders ORDER BY id');
+    assert.equal(await planning.probeWritable(['orders']), 'writable');
     const left = await bookkeeping.query<Row>(
       "SELECT name FROM sqlite_master WHERE name = 'llm_safe_sql_wprobe'",
     );
-    assert.equal(left.length, 0, 'the write probe must be rolled back');
+    assert.equal(left.length, 0, 'the write probe must leave no table behind');
+    assert.deepEqual(await bookkeeping.query<Row>('SELECT * FROM orders ORDER BY id'), before);
+  });
+
+  test('probeWritable says "unknown" when there was nothing it could ask about', async () => {
+    // Not "read-only". A table it cannot read establishes nothing, and reporting
+    // nothing as a boundary is the failure this method was rewritten to remove.
+    assert.equal(await planning.probeWritable(['no_such_table']), 'unknown');
+    assert.equal(await planning.probeWritable([]), 'unknown');
+  });
+
+  test('a zero-padded code does not ride along under an approved change', () => {
+    // The end-to-end shape of the compare.ts bug, kept here because the unit test
+    // for `sameValue` pins the primitive and this pins the consequence: the card
+    // said "1 row would change, across 1 column: name" while the statement also
+    // rewrote a stored code, and the apply committed both. It is the same defect
+    // as the microsecond ride-along above, in a different type.
+    return (async (): Promise<void> => {
+      await bookkeeping.query('DROP TABLE IF EXISTS padded');
+      await bookkeeping.query('CREATE TABLE padded (id INTEGER PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL)');
+      await bookkeeping.query("INSERT INTO padded VALUES (1, 'Ada', '00100')");
+      const e = new Engine({
+        adapter: planning,
+        policy: new Policy({ allow: ['padded'], impact: { padded: 'test table' } }),
+      });
+      const plan = await e.plan("UPDATE padded SET name = 'Grace', code = '100' WHERE id = 1");
+      assert.deepEqual(
+        [...plan.rows[0]?.changed ?? []].sort(),
+        ['code', 'name'],
+        'every column the statement really changed has to be on the card',
+      );
+      assert.equal(plan.rows[0]?.before['code'], '00100');
+      assert.equal(plan.rows[0]?.after['code'], '100');
+    })();
+  });
+
+  // =====================================================================
+  //  One at a time, per connection.
+  // =====================================================================
+
+  test('D6: two overlapping dry runs do not both open a transaction', async () => {
+    // The anti-nesting check asks the adapter whether a transaction is open, and
+    // it sits several awaits before the begin() it guards. Two calls that overlap
+    // therefore both saw "no transaction" and both opened one. On MySQL the
+    // second START TRANSACTION commits the first — a dry run made permanent and
+    // reported as rolled back. The MCP server reaches this with no concurrency in
+    // the caller at all: it serves tool calls as they arrive, on one session.
+    const before = await qtyOf(1);
+    const settled = await Promise.allSettled([
+      engine.plan('UPDATE orders SET qty = 91 WHERE id = 1'),
+      engine.plan('UPDATE orders SET qty = 92 WHERE id = 2'),
+    ]);
+
+    const refused = settled.filter((s) => s.status === 'rejected').map((s) => s.reason as PlanRefused);
+    assert.equal(refused.length, 1, 'exactly one of two overlapping dry runs may proceed');
+    assert.equal(refused[0]?.code, 'BUSY');
+    assert.equal(settled.filter((s) => s.status === 'fulfilled').length, 1);
+
+    assert.equal(await qtyOf(1), before, 'and production is untouched either way');
+  });
+
+  test('a read on the planning connection is refused while a dry run holds it', async () => {
+    // Not a nicety: that read would be served from inside the open trial
+    // transaction and would report the values we are only pretending about.
+    const e = new Engine({ adapter: planning, policy });
+    const planning_ = e.plan('UPDATE orders SET qty = 93 WHERE id = 1');
+    const read = e.read('SELECT qty FROM orders WHERE id = 1');
+    const [p, r] = await Promise.allSettled([planning_, read]);
+    assert.equal(p.status, 'fulfilled');
+    assert.equal(r.status, 'rejected');
+    assert.equal((r.reason as PlanRefused).code, 'BUSY');
+    assert.match((r.reason as PlanRefused).message, /readConnection/);
+  });
+
+  test('a read on a separate connection is not blocked by a dry run', async () => {
+    // The same reason it is safe: nothing is shared, so there is no transaction
+    // for the read to fall inside.
+    const ro = await SqliteAdapter.connect({ file, readOnly: true });
+    try {
+      const e = new Engine({ adapter: planning, readAdapter: ro, policy });
+      const [p, r] = await Promise.allSettled([
+        e.plan('UPDATE orders SET qty = 94 WHERE id = 1'),
+        e.read('SELECT qty FROM orders WHERE id = 1'),
+      ]);
+      assert.equal(p.status, 'fulfilled');
+      assert.equal(r.status, 'fulfilled');
+    } finally {
+      await ro.close();
+    }
   });
 });

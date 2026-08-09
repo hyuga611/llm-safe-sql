@@ -94,6 +94,20 @@ const FORBIDDEN: ReadonlyMap<string, string> = new Map([
   ['pg_sleep', 'stalling the server'],
   ['benchmark', 'stalling the server'],
   ['get_lock', 'stalling the server'],
+  // Reads that write. A sequence is not transactional on PostgreSQL: `nextval`
+  // advances it for everybody and a ROLLBACK does not put it back, so a "read"
+  // can permanently consume ids the rest of the application expects to issue.
+  // `setval` is worse and needs no explanation. These reach the read path, which
+  // is the one an injected instruction gets to first.
+  ['nextval', 'advancing a sequence, which a rollback does not undo'],
+  ['setval', 'moving a sequence'],
+  ['pg_read_file', 'reading a server file'],
+  ['pg_read_binary_file', 'reading a server file'],
+  ['pg_ls_dir', 'listing a server directory'],
+  ['lo_import', 'reading a server file'],
+  ['lo_export', 'writing to a server file'],
+  ['dblink', 'opening a connection to another server'],
+  ['dblink_exec', 'opening a connection to another server'],
   // Catalogs: credentials and other tenants live here.
   ['information_schema', 'system catalog'],
   ['performance_schema', 'system catalog'],

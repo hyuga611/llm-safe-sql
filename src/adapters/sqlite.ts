@@ -1,5 +1,5 @@
-import type { Adapter, ColumnShape, InboundCascade, Row, Savepoint, SelfCheckMode, TableShape } from '../adapter.js';
-import { AdapterUnusable } from '../adapter.js';
+import type { Adapter, ColumnShape, InboundCascade, Row, Savepoint, SelfCheckMode, TableShape, WriteAbility } from '../adapter.js';
+import { AdapterUnusable, probeWriteAbility } from '../adapter.js';
 
 export { AdapterUnusable };
 
@@ -140,7 +140,25 @@ export class SqliteAdapter implements Adapter {
     return this.readOnly;
   }
 
-  async selfCheck(_mode: SelfCheckMode = 'full'): Promise<void> {
+  /**
+   * The mode is honoured here, and the underscore it used to carry is the whole
+   * story: `_mode` was ignored, so this adapter branched on the handle's flag
+   * instead of on what it was being asked to prove. That is the same defect that
+   * was fixed for PostgreSQL, then missed for MySQL in the same commit — a
+   * parameter added to an interface and left unread by one implementation, which
+   * type checking cannot see. It survived here longest because the read/write
+   * split on SQLite is a file handle rather than a credential, so the two
+   * questions look like one.
+   *
+   * They are not. A *writable* handle configured as `readConnection` was given the
+   * full write probe on every read: `BEGIN IMMEDIATE` takes the whole database
+   * against other writers, and the read path would fail with "database is locked"
+   * whenever anything else was writing. And a *read-only* handle asked for `'full'`
+   * returned success having proven no rollback and no counting model, after which
+   * `check` printed "a rollback really undoes a write" about a connection that had
+   * demonstrated nothing of the kind.
+   */
+  async selfCheck(mode: SelfCheckMode = 'full'): Promise<void> {
     // A read-only handle is the recommended shape for the model side, so this is
     // not an error — but the flag is checked rather than believed. If a handle we
     // were told is read-only turns out to accept a write, the separation the
@@ -164,8 +182,20 @@ export class SqliteAdapter implements Adapter {
             'deployment depends on is not in place. Refusing to run.',
         );
       }
+      if (mode === 'full') {
+        throw new AdapterUnusable(
+          'This connection was opened read-only, and the write path cannot be verified on it: a dry run ' +
+            'really executes the statement before rolling it back. Use it as readConnection, and give ' +
+            '`connection` a handle that may write.',
+        );
+      }
       return; // Reads need no transaction, no counting model, and no rollback.
     }
+
+    // Everything below writes — a probe table, a rollback, a counting check —
+    // and the read path needs none of it. Demanding it of a read connection is
+    // how a guard written for one role ends up refusing another.
+    if (mode === 'read') return;
 
     // Foreign keys are pinned rather than inherited. SQLite's own default is off,
     // the Node driver's default is on, and an application can change it per
@@ -245,8 +275,13 @@ export class SqliteAdapter implements Adapter {
   }
 
   async introspect(table: string): Promise<TableShape> {
+    // Case-insensitively, because that is how SQLite itself resolves the name.
+    // With `= ?` a table created as `Orders` and allowlisted as `orders` was
+    // reported as not found, while the statement the engine was about to run
+    // would have resolved it perfectly well — the guard disagreeing with the
+    // database about which tables exist.
     const meta = this.one<{ type: string; sql: string | null }>(
-      "SELECT type, sql FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
+      "SELECT type, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE AND type IN ('table', 'view')",
       table,
     );
     if (meta === undefined) throw new AdapterUnusable(`Table "${table}" was not found.`);
@@ -277,9 +312,19 @@ export class SqliteAdapter implements Adapter {
       .sort((a, b) => count(a.pk) - count(b.pk))
       .map((c) => c.name);
 
+    // `tbl_name` holds the name as the CREATE TRIGGER spelled it, and SQLite
+    // table names are case-insensitive — so `CREATE TABLE Orders` with
+    // `CREATE TRIGGER … ON orders` stored two different strings for one table. A
+    // `= ?` comparison missed the trigger, `autoColumnsKnown` came back true, and
+    // the engine then reported "no column moves by itself" about a table with a
+    // trigger writing to it. The inbound-cascade scan twenty lines below already
+    // folded case for exactly this reason; this query did not.
+    //
+    // NOCASE is SQLite's own ASCII case folding, which is the same rule it uses
+    // to resolve the table name in the first place.
     const triggerCount = count(
       this.one<{ n: number | bigint }>(
-        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE",
         table,
       )?.n,
     );
@@ -408,31 +453,64 @@ export class SqliteAdapter implements Adapter {
   }
 
   /**
+   * Ask SQLite whether this handle may change the allowlisted tables.
+   *
+   * A read-only handle is still probed rather than assumed. It would be true to
+   * return `'read-only'` on the flag alone — SQLite enforces it in the library
+   * below us — but the flag records what we *asked* for, and the answer this
+   * command exists to give is what the database will actually refuse. The
+   * difference costs two statements and covers the case the flag cannot see: a
+   * writable handle on a file the filesystem will not let us write.
+   *
+   * No savepoints, unlike Postgres: SQLite leaves a transaction usable after a
+   * statement is refused.
+   */
+  async probeWritable(tables: readonly string[]): Promise<WriteAbility> {
+    if (this.inTransaction()) return 'unknown';
+    const attempt = async (sql: string): Promise<boolean> => {
+      try {
+        this.db.exec(sql);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const columnsOf = async (t: string): Promise<readonly string[]> =>
+      (await this.introspect(t)).columns.map((c) => c.name);
+    const quote = (name: string): string => this.quoteIdent(name);
+
+    // A read-only handle cannot open a write transaction, and failing to open one
+    // must not be mistaken for failing to write. Nothing here can change the file
+    // anyway — that is the proposition under test.
+    let wrapped = false;
+    if (!this.readOnly) {
+      try {
+        this.db.exec('BEGIN IMMEDIATE');
+        wrapped = true;
+      } catch {
+        wrapped = false;
+      }
+    }
+    try {
+      return await probeWriteAbility(tables, columnsOf, quote, attempt);
+    } finally {
+      if (wrapped) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch {
+          /* nothing to undo */
+        }
+      }
+    }
+  }
+
+  /**
    * Empty, and deliberately so: SQLite has no row locks to take.
    *
    * The guarantee `FOR UPDATE` provides elsewhere is provided here by
    * {@link begin} opening with `BEGIN IMMEDIATE`, which holds the whole database
    * against other writers for the life of the transaction.
    */
-  /** SQLite answers this without a probe: a read-only handle refuses every write. */
-  async probeWritable(): Promise<boolean> {
-    if (this.readOnly) return false;
-    try {
-      this.db.exec('BEGIN IMMEDIATE');
-      this.db.exec('CREATE TABLE llm_safe_sql_wprobe (id INTEGER)');
-      return true;
-    } catch {
-      return false;
-    } finally {
-      try {
-        this.db.exec('ROLLBACK');
-      } catch {
-        /* nothing to undo */
-      }
-      this.open = false;
-    }
-  }
-
   rowLockClause(): string {
     return '';
   }

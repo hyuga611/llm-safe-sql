@@ -1,3 +1,6 @@
+> **Archived — moved.** Development of llm-safe-sql continues in the [airframe](https://github.com/hyuga611/airframe) monorepo: [`packages/llm-safe-sql`](https://github.com/hyuga611/airframe/tree/main/packages/llm-safe-sql). Versions 0.10.1 and later of `@hyuga/llm-safe-sql` are published from there; this repository stops at 0.9.x and is read-only so that links in older articles keep working.
+>
+> **移転しました。** llm-safe-sql は [airframe](https://github.com/hyuga611/airframe) の `packages/llm-safe-sql` で開発を続けています（npm の 0.10.1 以降はそちらから公開）。このリポジトリは 0.9.x で止まっています。
 
 # llm-safe-sql
 

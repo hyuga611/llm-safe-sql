@@ -1,3 +1,4 @@
+
 # llm-safe-sql
 
 [![CI](https://github.com/hyuga611/llm-safe-sql/actions/workflows/ci.yml/badge.svg)](https://github.com/hyuga611/llm-safe-sql/actions/workflows/ci.yml)
